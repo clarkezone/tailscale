@@ -10,6 +10,7 @@ rules:
   # Create can not be restricted to a resource name.
   verbs: ["create"]
 - apiGroups: [""] # "" indicates the core API group
-  resourceNames: ["{{TS_KUBE_SECRET}}"]
+  # doesn't work on k3s CONFIRM
+  #  resourceNames: ["{{TS_KUBE_SECRET}}"]
   resources: ["secrets"]
   verbs: ["get", "update", "patch"]

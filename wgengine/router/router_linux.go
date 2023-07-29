@@ -21,6 +21,7 @@ import (
 	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
+
 	"tailscale.com/envknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
@@ -60,6 +61,7 @@ func newNetfilterRunner(logf logger.Logf) (netfilterRunner, error) {
 	var nfr netfilterRunner
 	var err error
 	if envknob.Bool("TS_DEBUG_USE_NETLINK_NFTABLES") {
+		//	if true {
 		logf("router: using nftables")
 		nfr, err = linuxfw.NewNfTablesRunner(logf)
 		if err != nil {

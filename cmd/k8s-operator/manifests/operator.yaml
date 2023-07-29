@@ -145,7 +145,9 @@ spec:
             - name: CLIENT_SECRET_FILE
               value: /oauth/client_secret
             - name: PROXY_IMAGE
-              value: tailscale/tailscale:unstable
+              #              value: tailscale/tailscale:unstable
+              value: clarkezone/tsclientnft:v47
+
             - name: PROXY_TAGS
               value: tag:k8s
             - name: AUTH_PROXY
