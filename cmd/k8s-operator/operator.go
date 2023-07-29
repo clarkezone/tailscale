@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
+
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -55,17 +56,19 @@ func main() {
 	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 
 	var (
-		hostname           = defaultEnv("OPERATOR_HOSTNAME", "tailscale-operator")
-		kubeSecret         = defaultEnv("OPERATOR_SECRET", "")
-		operatorTags       = defaultEnv("OPERATOR_INITIAL_TAGS", "tag:k8s-operator")
-		tsNamespace        = defaultEnv("OPERATOR_NAMESPACE", "")
-		tslogging          = defaultEnv("OPERATOR_LOGGING", "info")
-		clientIDPath       = defaultEnv("CLIENT_ID_FILE", "")
-		clientSecretPath   = defaultEnv("CLIENT_SECRET_FILE", "")
-		image              = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
+		hostname         = defaultEnv("OPERATOR_HOSTNAME", "tailscale-operator")
+		kubeSecret       = defaultEnv("OPERATOR_SECRET", "")
+		operatorTags     = defaultEnv("OPERATOR_INITIAL_TAGS", "tag:k8s-operator")
+		tsNamespace      = defaultEnv("OPERATOR_NAMESPACE", "")
+		tslogging        = defaultEnv("OPERATOR_LOGGING", "info")
+		clientIDPath     = defaultEnv("CLIENT_ID_FILE", "")
+		clientSecretPath = defaultEnv("CLIENT_SECRET_FILE", "")
+		//image              = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
+		image              = defaultEnv("PROXY_IMAGE", "clarkezone/tsclientnft:nftdenv5")
 		priorityClassName  = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags               = defaultEnv("PROXY_TAGS", "tag:k8s")
 		shouldRunAuthProxy = defaultBool("AUTH_PROXY", false)
+		usenft             = defaultBool("OPERATOR_USENFT", false)
 	)
 
 	var opts []kzap.Opts
@@ -207,6 +210,7 @@ waitOnline:
 		proxyImage:             image,
 		proxyPriorityClassName: priorityClassName,
 		logger:                 zlog.Named("service-reconciler"),
+		useNft:                 usenft,
 	}
 
 	reconcileFilter := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
@@ -285,6 +289,7 @@ type ServiceReconciler struct {
 	proxyImage             string
 	proxyPriorityClassName string
 	logger                 *zap.SugaredLogger
+	useNft                 bool
 }
 
 type tsClient interface {
@@ -625,6 +630,13 @@ func (a *ServiceReconciler) reconcileSTS(ctx context.Context, logger *zap.Sugare
 			Name:  "TS_HOSTNAME",
 			Value: hostname,
 		})
+	if a.useNft {
+		container.Env = append(container.Env,
+			corev1.EnvVar{
+				Name:  "TS_TEST_USENFTPROXY",
+				Value: "true",
+			})
+	}
 	ss.ObjectMeta = metav1.ObjectMeta{
 		Name:      headlessSvc.Name,
 		Namespace: a.operatorNamespace,
