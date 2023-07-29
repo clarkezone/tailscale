@@ -60,8 +60,8 @@ type netfilterRunner interface {
 func newNetfilterRunner(logf logger.Logf) (netfilterRunner, error) {
 	var nfr netfilterRunner
 	var err error
-	if envknob.Bool("TS_DEBUG_USE_NETLINK_NFTABLES") {
-		//	if true {
+	//if envknob.Bool("TS_DEBUG_USE_NETLINK_NFTABLES") {
+	if true {
 		logf("router: using nftables")
 		nfr, err = linuxfw.NewNfTablesRunner(logf)
 		if err != nil {
