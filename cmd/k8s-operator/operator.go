@@ -64,7 +64,7 @@ func main() {
 		clientIDPath     = defaultEnv("CLIENT_ID_FILE", "")
 		clientSecretPath = defaultEnv("CLIENT_SECRET_FILE", "")
 		//image              = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
-		image              = defaultEnv("PROXY_IMAGE", "clarkezone/tsclientnft:nftdenv5")
+		image              = defaultEnv("PROXY_IMAGE", "clarkezone/tsclientnftfix:latest")
 		priorityClassName  = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags               = defaultEnv("PROXY_TAGS", "tag:k8s")
 		shouldRunAuthProxy = defaultBool("AUTH_PROXY", false)
