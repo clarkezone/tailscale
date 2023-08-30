@@ -9,8 +9,6 @@ import (
 	"tailscale.com/envknob"
 )
 
-const linkDebug = true
-
 // Various debugging and experimental tweakables, set by environment
 // variable.
 var (
@@ -44,6 +42,13 @@ var (
 	// debugSendCallMeUnknownPeer sends a CallMeMaybe to a non-existent destination every
 	// time we send a real CallMeMaybe to test the PeerGoneNotHere logic.
 	debugSendCallMeUnknownPeer = envknob.RegisterBool("TS_DEBUG_SEND_CALLME_UNKNOWN_PEER")
+	// debugBindSocket prints extra debugging about socket rebinding in magicsock.
+	debugBindSocket = envknob.RegisterBool("TS_DEBUG_MAGICSOCK_BIND_SOCKET")
+	// debugRingBufferMaxSizeBytes overrides the default size of the endpoint
+	// history ringbuffer.
+	debugRingBufferMaxSizeBytes = envknob.RegisterInt("TS_DEBUG_MAGICSOCK_RING_BUFFER_MAX_SIZE_BYTES")
+	// debugPMTUD enables path MTU discovery. Currently only sets the Don't Fragment sockopt.
+	debugPMTUD = envknob.RegisterBool("TS_DEBUG_ENABLE_PMTUD")
 	// Hey you! Adding a new debugknob? Make sure to stub it out in the debugknob_stubs.go
 	// file too.
 )

@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !plan9
+
 package main
 
 import (
@@ -32,12 +34,15 @@ func TestLoadBalancerClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -75,6 +80,7 @@ func TestLoadBalancerClass(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -98,6 +104,9 @@ func TestLoadBalancerClass(t *testing.T) {
 				Ingress: []corev1.LoadBalancerIngress{
 					{
 						Hostname: "tailscale.device.name",
+					},
+					{
+						IP: "100.99.98.97",
 					},
 				},
 			},
@@ -153,12 +162,15 @@ func TestAnnotations(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -250,12 +262,15 @@ func TestAnnotationIntoLB(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -295,6 +310,7 @@ func TestAnnotationIntoLB(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -353,6 +369,9 @@ func TestAnnotationIntoLB(t *testing.T) {
 					{
 						Hostname: "tailscale.device.name",
 					},
+					{
+						IP: "100.99.98.97",
+					},
 				},
 			},
 		},
@@ -368,12 +387,15 @@ func TestLBIntoAnnotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -411,6 +433,7 @@ func TestLBIntoAnnotation(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -434,6 +457,9 @@ func TestLBIntoAnnotation(t *testing.T) {
 				Ingress: []corev1.LoadBalancerIngress{
 					{
 						Hostname: "tailscale.device.name",
+					},
+					{
+						IP: "100.99.98.97",
 					},
 				},
 			},
@@ -491,12 +517,15 @@ func TestCustomHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -593,13 +622,16 @@ func TestCustomPriorityClassName(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:                 fc,
-		tsClient:               ft,
-		defaultTags:            []string{"tag:k8s"},
-		operatorNamespace:      "operator-ns",
-		proxyImage:             "tailscale/tailscale",
-		proxyPriorityClassName: "tailscale-critical",
-		logger:                 zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:                 fc,
+			tsClient:               ft,
+			defaultTags:            []string{"tag:k8s"},
+			operatorNamespace:      "operator-ns",
+			proxyImage:             "tailscale/tailscale",
+			proxyPriorityClassName: "tailscale-critical",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -628,6 +660,52 @@ func TestCustomPriorityClassName(t *testing.T) {
 	fullName, shortName := findGenName(t, fc, "default", "test")
 
 	expectEqual(t, fc, expectedSTS(shortName, fullName, "custom-priority-class-name", "tailscale-critical"))
+}
+
+func TestDefaultLoadBalancer(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:                zl.Sugar(),
+		isDefaultLoadBalancer: true,
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.20.30.40",
+			Type:      corev1.ServiceTypeLoadBalancer,
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test")
+
+	expectEqual(t, fc, expectedSecret(fullName))
+	expectEqual(t, fc, expectedHeadlessService(shortName))
+	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test", ""))
 }
 
 func expectedSecret(name string) *corev1.Secret {
@@ -702,6 +780,10 @@ func expectedSTS(stsName, secretName, hostname, priorityClassName string) *appsv
 			ServiceName: stsName,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"tailscale.com/operator-last-set-hostname": hostname,
+						"tailscale.com/operator-last-set-ip":       "10.20.30.40",
+					},
 					DeletionGracePeriodSeconds: ptr.To[int64](10),
 					Labels:                     map[string]string{"app": "1234-UID"},
 				},
@@ -726,9 +808,9 @@ func expectedSTS(stsName, secretName, hostname, priorityClassName string) *appsv
 							Env: []corev1.EnvVar{
 								{Name: "TS_USERSPACE", Value: "false"},
 								{Name: "TS_AUTH_ONCE", Value: "true"},
-								{Name: "TS_DEST_IP", Value: "10.20.30.40"},
 								{Name: "TS_KUBE_SECRET", Value: secretName},
 								{Name: "TS_HOSTNAME", Value: hostname},
+								{Name: "TS_DEST_IP", Value: "10.20.30.40"},
 							},
 							SecurityContext: &corev1.SecurityContext{
 								Capabilities: &corev1.Capabilities{
@@ -755,6 +837,9 @@ func findGenName(t *testing.T, client client.Client, ns, name string) (full, noS
 	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
 	if err != nil {
 		t.Fatalf("finding secret for %q: %v", name, err)
+	}
+	if s == nil {
+		t.Fatalf("no secret found for %q", name)
 	}
 	return s.GetName(), strings.TrimSuffix(s.GetName(), "-0")
 }

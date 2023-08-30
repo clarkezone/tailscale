@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"tailscale.com/net/dnscache"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -139,8 +138,8 @@ func (d *Dialer) SetNetMon(netMon *netmon.Monitor) {
 	d.netMonUnregister = d.netMon.RegisterChangeCallback(d.linkChanged)
 }
 
-func (d *Dialer) linkChanged(major bool, state *interfaces.State) {
-	if !major {
+func (d *Dialer) linkChanged(delta *netmon.ChangeDelta) {
+	if !delta.Major {
 		return
 	}
 	d.mu.Lock()
@@ -203,6 +202,8 @@ func (d *Dialer) SetNetMap(nm *netmap.NetworkMap) {
 	d.dns = m
 }
 
+// userDialResolve resolves addr as if a user initiating the dial. (e.g. from a
+// SOCKS or HTTP outbound proxy)
 func (d *Dialer) userDialResolve(ctx context.Context, network, addr string) (netip.AddrPort, error) {
 	d.mu.Lock()
 	dns := d.dns
@@ -298,8 +299,8 @@ func (d *Dialer) SystemDial(ctx context.Context, network, addr string) (net.Conn
 	}, nil
 }
 
-// UserDial connects to the provided network address as if a user were initiating the dial.
-// (e.g. from a SOCKS or HTTP outbound proxy)
+// UserDial connects to the provided network address as if a user were
+// initiating the dial. (e.g. from a SOCKS or HTTP outbound proxy)
 func (d *Dialer) UserDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	ipp, err := d.userDialResolve(ctx, network, addr)
 	if err != nil {

@@ -19,10 +19,11 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/exp/slices"
+	"go4.org/netipx"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
 	"tailscale.com/net/dns/recursive"
@@ -76,11 +77,11 @@ func MakeLookupFunc(logf logger.Logf, netMon *netmon.Monitor) func(ctx context.C
 				metricRecursiveErrors.Add(1)
 				return
 			}
-			slices.SortFunc(addrs, func(a, b netip.Addr) bool { return a.Less(b) })
+			slices.SortFunc(addrs, netipx.CompareAddr)
 
 			// Wait for a response from the main function
 			oldAddrs := <-addrsCh
-			slices.SortFunc(oldAddrs, func(a, b netip.Addr) bool { return a.Less(b) })
+			slices.SortFunc(oldAddrs, netipx.CompareAddr)
 
 			matches := slices.Equal(addrs, oldAddrs)
 

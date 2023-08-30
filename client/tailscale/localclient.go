@@ -37,6 +37,7 @@ import (
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/cmpx"
 )
 
 // defaultLocalClient is the default LocalClient when using the legacy
@@ -259,6 +260,28 @@ func (lc *LocalClient) DaemonMetrics(ctx context.Context) ([]byte, error) {
 	return lc.get200(ctx, "/localapi/v0/metrics")
 }
 
+// IncrementCounter increments the value of a Tailscale daemon's counter
+// metric by the given delta. If the metric has yet to exist, a new counter
+// metric is created and initialized to delta.
+//
+// IncrementCounter does not support gauge metrics or negative delta values.
+func (lc *LocalClient) IncrementCounter(ctx context.Context, name string, delta int) error {
+	type metricUpdate struct {
+		Name  string `json:"name"`
+		Type  string `json:"type"`
+		Value int    `json:"value"` // amount to increment by
+	}
+	if delta < 0 {
+		return errors.New("negative delta not allowed")
+	}
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]metricUpdate{{
+		Name:  name,
+		Type:  "counter",
+		Value: delta,
+	}}))
+	return err
+}
+
 // TailDaemonLogs returns a stream the Tailscale daemon's logs as they arrive.
 // Close the context to stop the stream.
 func (lc *LocalClient) TailDaemonLogs(ctx context.Context) (io.Reader, error) {
@@ -369,15 +392,51 @@ func (lc *LocalClient) DebugAction(ctx context.Context, action string) error {
 	return nil
 }
 
+// DebugPortmapOpts contains options for the DebugPortmap command.
+type DebugPortmapOpts struct {
+	// Duration is how long the mapping should be created for. It defaults
+	// to 5 seconds if not set.
+	Duration time.Duration
+
+	// Type is the kind of portmap to debug. The empty string instructs the
+	// portmap client to perform all known types. Other valid options are
+	// "pmp", "pcp", and "upnp".
+	Type string
+
+	// GatewayAddr specifies the gateway address used during portmapping.
+	// If set, SelfAddr must also be set. If unset, it will be
+	// autodetected.
+	GatewayAddr netip.Addr
+
+	// SelfAddr specifies the gateway address used during portmapping. If
+	// set, GatewayAddr must also be set. If unset, it will be
+	// autodetected.
+	SelfAddr netip.Addr
+
+	// LogHTTP instructs the debug-portmap endpoint to print all HTTP
+	// requests and responses made to the logs.
+	LogHTTP bool
+}
+
 // DebugPortmap invokes the debug-portmap endpoint, and returns an
 // io.ReadCloser that can be used to read the logs that are printed during this
 // process.
-func (lc *LocalClient) DebugPortmap(ctx context.Context, duration time.Duration, ty, gwSelf string) (io.ReadCloser, error) {
+//
+// opts can be nil; if so, default values will be used.
+func (lc *LocalClient) DebugPortmap(ctx context.Context, opts *DebugPortmapOpts) (io.ReadCloser, error) {
 	vals := make(url.Values)
-	vals.Set("duration", duration.String())
-	vals.Set("type", ty)
-	if gwSelf != "" {
-		vals.Set("gateway_and_self", gwSelf)
+	if opts == nil {
+		opts = &DebugPortmapOpts{}
+	}
+
+	vals.Set("duration", cmpx.Or(opts.Duration, 5*time.Second).String())
+	vals.Set("type", opts.Type)
+	vals.Set("log_http", strconv.FormatBool(opts.LogHTTP))
+
+	if opts.GatewayAddr.IsValid() != opts.SelfAddr.IsValid() {
+		return nil, fmt.Errorf("both GatewayAddr and SelfAddr must be provided if one is")
+	} else if opts.GatewayAddr.IsValid() {
+		vals.Set("gateway_and_self", fmt.Sprintf("%s/%s", opts.GatewayAddr, opts.SelfAddr))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+apitype.LocalAPIHost+"/localapi/v0/debug-portmap?"+vals.Encode(), nil)
@@ -807,17 +866,37 @@ func (lc *LocalClient) ExpandSNIName(ctx context.Context, name string) (fqdn str
 	return "", false
 }
 
+// PingOpts contains options for the ping request.
+//
+// The zero value is valid, which means to use defaults.
+type PingOpts struct {
+	// Size is the length of the ping message in bytes. It's ignored if it's
+	// smaller than the minimum message size.
+	//
+	// For disco pings, it specifies the length of the packet's payload. That
+	// is, it includes the disco headers and message, but not the IP and UDP
+	// headers.
+	Size int
+}
+
 // Ping sends a ping of the provided type to the provided IP and waits
-// for its response.
-func (lc *LocalClient) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error) {
+// for its response. The opts type specifies additional options.
+func (lc *LocalClient) PingWithOpts(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType, opts PingOpts) (*ipnstate.PingResult, error) {
 	v := url.Values{}
 	v.Set("ip", ip.String())
+	v.Set("size", strconv.Itoa(opts.Size))
 	v.Set("type", string(pingtype))
 	body, err := lc.send(ctx, "POST", "/localapi/v0/ping?"+v.Encode(), 200, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error %w: %s", err, body)
 	}
 	return decodeJSON[*ipnstate.PingResult](body)
+}
+
+// Ping sends a ping of the provided type to the provided IP and waits
+// for its response.
+func (lc *LocalClient) Ping(ctx context.Context, ip netip.Addr, pingtype tailcfg.PingType) (*ipnstate.PingResult, error) {
+	return lc.PingWithOpts(ctx, ip, pingtype, PingOpts{})
 }
 
 // NetworkLockStatus fetches information about the tailnet key authority, if one is configured.
@@ -961,6 +1040,42 @@ func (lc *LocalClient) NetworkLockVerifySigningDeeplink(ctx context.Context, url
 	return decodeJSON[*tka.DeeplinkValidationResult](body)
 }
 
+// NetworkLockGenRecoveryAUM generates an AUM for recovering from a tailnet-lock key compromise.
+func (lc *LocalClient) NetworkLockGenRecoveryAUM(ctx context.Context, removeKeys []tkatype.KeyID, forkFrom tka.AUMHash) ([]byte, error) {
+	vr := struct {
+		Keys     []tkatype.KeyID
+		ForkFrom string
+	}{removeKeys, forkFrom.String()}
+
+	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/generate-recovery-aum", 200, jsonBody(vr))
+	if err != nil {
+		return nil, fmt.Errorf("sending generate-recovery-aum: %w", err)
+	}
+
+	return body, nil
+}
+
+// NetworkLockCosignRecoveryAUM co-signs a recovery AUM using the node's tailnet lock key.
+func (lc *LocalClient) NetworkLockCosignRecoveryAUM(ctx context.Context, aum tka.AUM) ([]byte, error) {
+	r := bytes.NewReader(aum.Serialize())
+	body, err := lc.send(ctx, "POST", "/localapi/v0/tka/cosign-recovery-aum", 200, r)
+	if err != nil {
+		return nil, fmt.Errorf("sending cosign-recovery-aum: %w", err)
+	}
+
+	return body, nil
+}
+
+// NetworkLockSubmitRecoveryAUM submits a recovery AUM to the control plane.
+func (lc *LocalClient) NetworkLockSubmitRecoveryAUM(ctx context.Context, aum tka.AUM) error {
+	r := bytes.NewReader(aum.Serialize())
+	_, err := lc.send(ctx, "POST", "/localapi/v0/tka/submit-recovery-aum", 200, r)
+	if err != nil {
+		return fmt.Errorf("sending cosign-recovery-aum: %w", err)
+	}
+	return nil
+}
+
 // SetServeConfig sets or replaces the serving settings.
 // If config is nil, settings are cleared and serving is disabled.
 func (lc *LocalClient) SetServeConfig(ctx context.Context, config *ipn.ServeConfig) error {
@@ -977,6 +1092,29 @@ func (lc *LocalClient) NetworkLockDisable(ctx context.Context, secret []byte) er
 		return fmt.Errorf("error: %w", err)
 	}
 	return nil
+}
+
+// StreamServe returns an io.ReadCloser that streams serve/Funnel
+// connections made to the provided HostPort.
+//
+// If Serve and Funnel were not already enabled for the HostPort in the ServeConfig,
+// the backend enables it for the duration of the context's lifespan and
+// then turns it back off once the context is closed. If either are already enabled,
+// then they remain that way but logs are still streamed
+func (lc *LocalClient) StreamServe(ctx context.Context, hp ipn.ServeStreamRequest) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://"+apitype.LocalAPIHost+"/localapi/v0/stream-serve", jsonBody(hp))
+	if err != nil {
+		return nil, err
+	}
+	res, err := lc.doLocalRequestNiceError(req)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != 200 {
+		res.Body.Close()
+		return nil, errors.New(res.Status)
+	}
+	return res.Body, nil
 }
 
 // GetServeConfig return the current serve config.
@@ -1086,6 +1224,27 @@ func (lc *LocalClient) SwitchProfile(ctx context.Context, profile ipn.ProfileID)
 func (lc *LocalClient) DeleteProfile(ctx context.Context, profile ipn.ProfileID) error {
 	_, err := lc.send(ctx, "DELETE", "/localapi/v0/profiles"+url.PathEscape(string(profile)), http.StatusNoContent, nil)
 	return err
+}
+
+// QueryFeature makes a request for instructions on how to enable
+// a feature, such as Funnel, for the node's tailnet. If relevant,
+// this includes a control server URL the user can visit to enable
+// the feature.
+//
+// If you are looking to use QueryFeature, you'll likely want to
+// use cli.enableFeatureInteractive instead, which handles the logic
+// of wraping QueryFeature and translating its response into an
+// interactive flow for the user, including using the IPN notify bus
+// to block until the feature has been enabled.
+//
+// 2023-08-09: Valid feature values are "serve" and "funnel".
+func (lc *LocalClient) QueryFeature(ctx context.Context, feature string) (*tailcfg.QueryFeatureResponse, error) {
+	v := url.Values{"feature": {feature}}
+	body, err := lc.send(ctx, "POST", "/localapi/v0/query-feature?"+v.Encode(), 200, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error %w: %s", err, body)
+	}
+	return decodeJSON[*tailcfg.QueryFeatureResponse](body)
 }
 
 func (lc *LocalClient) DebugDERPRegion(ctx context.Context, regionIDOrCode string) (*ipnstate.DebugDERPRegionReport, error) {

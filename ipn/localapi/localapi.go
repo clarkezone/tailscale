@@ -13,19 +13,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -37,15 +36,19 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/ptr"
+	"tailscale.com/types/tkatype"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/osdiag"
 	"tailscale.com/version"
 )
 
@@ -95,6 +98,7 @@ var handler = map[string]localAPIHandler{
 	"set-expiry-sooner":           (*Handler).serveSetExpirySooner,
 	"start":                       (*Handler).serveStart,
 	"status":                      (*Handler).serveStatus,
+	"stream-serve":                (*Handler).serveStreamServe,
 	"tka/init":                    (*Handler).serveTKAInit,
 	"tka/log":                     (*Handler).serveTKALog,
 	"tka/modify":                  (*Handler).serveTKAModify,
@@ -105,9 +109,13 @@ var handler = map[string]localAPIHandler{
 	"tka/affected-sigs":           (*Handler).serveTKAAffectedSigs,
 	"tka/wrap-preauth-key":        (*Handler).serveTKAWrapPreauthKey,
 	"tka/verify-deeplink":         (*Handler).serveTKAVerifySigningDeeplink,
+	"tka/generate-recovery-aum":   (*Handler).serveTKAGenerateRecoveryAUM,
+	"tka/cosign-recovery-aum":     (*Handler).serveTKACosignRecoveryAUM,
+	"tka/submit-recovery-aum":     (*Handler).serveTKASubmitRecoveryAUM,
 	"upload-client-metrics":       (*Handler).serveUploadClientMetrics,
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
+	"query-feature":               (*Handler).serveQueryFeature,
 }
 
 func randHex(n int) string {
@@ -129,7 +137,7 @@ var (
 // NewHandler creates a new LocalAPI HTTP handler. All parameters except netMon
 // are required (if non-nil it's used to do faster interface lookups).
 func NewHandler(b *ipnlocal.LocalBackend, logf logger.Logf, netMon *netmon.Monitor, logID logid.PublicID) *Handler {
-	return &Handler{b: b, logf: logf, netMon: netMon, backendLogID: logID}
+	return &Handler{b: b, logf: logf, netMon: netMon, backendLogID: logID, clock: tstime.StdClock{}}
 }
 
 type Handler struct {
@@ -155,6 +163,7 @@ type Handler struct {
 	logf         logger.Logf
 	netMon       *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
 	backendLogID logid.PublicID
+	clock        tstime.Clock
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -309,7 +318,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	defer h.b.TryFlushLogs() // kick off upload after bugreport's done logging
 
 	logMarker := func() string {
-		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, time.Now().UTC().Format("20060102150405Z"), randHex(8))
+		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, h.clock.Now().UTC().Format("20060102150405Z"), randHex(8))
 	}
 	if envknob.NoLogsNoSupport() {
 		logMarker = func() string { return "BUG-NO-LOGS-NO-SUPPORT-this-node-has-had-its-logging-disabled" }
@@ -330,8 +339,8 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 
 	// Information about the current node from the netmap
 	if nm := h.b.NetMap(); nm != nil {
-		if self := nm.SelfNode; self != nil {
-			h.logf("user bugreport node info: nodeid=%q stableid=%q expiry=%q", self.ID, self.StableID, self.KeyExpiry.Format(time.RFC3339))
+		if self := nm.SelfNode; self.Valid() {
+			h.logf("user bugreport node info: nodeid=%q stableid=%q expiry=%q", self.ID(), self.StableID(), self.KeyExpiry().Format(time.RFC3339))
 		}
 		h.logf("user bugreport public keys: machine=%q node=%q", nm.MachineKey, nm.NodeKey)
 	} else {
@@ -342,6 +351,9 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	// printing them here ensures we don't have to go spelunking through
 	// logs for them.
 	envknob.LogCurrent(logger.WithPrefix(h.logf, "user bugreport: "))
+
+	// OS-specific details
+	osdiag.LogSupportInfo(logger.WithPrefix(h.logf, "user bugreport OS: "), osdiag.LogSupportInfoReasonBugReport)
 
 	if defBool(r.URL.Query().Get("diagnose"), false) {
 		h.b.Doctor(r.Context(), logger.WithPrefix(h.logf, "diag: "))
@@ -355,7 +367,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	until := time.Now().Add(12 * time.Hour)
+	until := h.clock.Now().Add(12 * time.Hour)
 
 	var changed map[string]bool
 	for _, component := range []string{"magicsock"} {
@@ -425,8 +437,8 @@ func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res := &apitype.WhoIsResponse{
-		Node:        n,
-		UserProfile: &u,
+		Node:        n.AsStruct(), // always non-nil per WhoIsResponse contract
+		UserProfile: &u,           // always non-nil per WhoIsResponse contract
 		CapMap:      b.PeerCaps(ipp.Addr()),
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
@@ -547,7 +559,10 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		h.b.DebugNotify(n)
-
+	case "break-tcp-conns":
+		err = h.b.DebugBreakTCPConns()
+	case "break-derp-conns":
+		err = h.b.DebugBreakDERPConns()
 	case "":
 		err = fmt.Errorf("missing parameter 'action'")
 	default:
@@ -643,6 +658,10 @@ func (h *Handler) serveDebugPortmap(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown portmap debug type", http.StatusBadRequest)
 		return
+	}
+
+	if defBool(r.FormValue("log_http"), false) {
+		debugKnobs.LogHTTP = true
 	}
 
 	var (
@@ -766,7 +785,7 @@ func (h *Handler) serveComponentDebugLogging(w http.ResponseWriter, r *http.Requ
 	}
 	component := r.FormValue("component")
 	secs, _ := strconv.Atoi(r.FormValue("secs"))
-	err := h.b.SetComponentDebugLogging(component, time.Now().Add(time.Duration(secs)*time.Second))
+	err := h.b.SetComponentDebugLogging(component, h.clock.Now().Add(time.Duration(secs)*time.Second))
 	var res struct {
 		Error string
 	}
@@ -840,6 +859,31 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveStreamServe handles foreground serve and funnel streams. This is
+// currently in development per https://github.com/tailscale/tailscale/issues/8489
+func (h *Handler) serveStreamServe(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		// Write permission required because we modify the ServeConfig.
+		http.Error(w, "serve stream denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ipn.ServeStreamRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorJSON(w, fmt.Errorf("decoding HostPort: %w", err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := h.b.StreamServe(r.Context(), w, req); err != nil {
+		writeErrorJSON(w, fmt.Errorf("streaming serve: %w", err))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -1335,7 +1379,24 @@ func (h *Handler) servePing(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing 'type' parameter", 400)
 		return
 	}
-	res, err := h.b.Ping(ctx, ip, tailcfg.PingType(pingTypeStr))
+	size := 0
+	sizeStr := r.FormValue("size")
+	if sizeStr != "" {
+		size, err = strconv.Atoi(sizeStr)
+		if err != nil {
+			http.Error(w, "invalid 'size' parameter", 400)
+			return
+		}
+		if size != 0 && tailcfg.PingType(pingTypeStr) != tailcfg.PingDisco {
+			http.Error(w, "'size' parameter is only supported with disco pings", 400)
+			return
+		}
+		if size > int(tstun.DefaultMTU()) {
+			http.Error(w, fmt.Sprintf("maximum value for 'size' is %v", tstun.DefaultMTU()), 400)
+			return
+		}
+	}
+	res, err := h.b.Ping(ctx, ip, tailcfg.PingType(pingTypeStr), size)
 	if err != nil {
 		writeErrorJSON(w, err)
 		return
@@ -1426,10 +1487,9 @@ func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	type clientMetricJSON struct {
-		Name string `json:"name"`
-		// One of "counter" or "gauge"
-		Type  string `json:"type"`
-		Value int    `json:"value"`
+		Name  string `json:"name"`
+		Type  string `json:"type"`  // one of "counter" or "gauge"
+		Value int    `json:"value"` // amount to increment metric by
 	}
 
 	var clientMetrics []clientMetricJSON
@@ -1651,7 +1711,7 @@ func (h *Handler) serveTKADisable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := io.LimitReader(r.Body, 1024*1024)
-	secret, err := ioutil.ReadAll(body)
+	secret, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, "reading secret", 400)
 		return
@@ -1724,7 +1784,7 @@ func (h *Handler) serveTKAAffectedSigs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
-	keyID, err := ioutil.ReadAll(http.MaxBytesReader(w, r.Body, 2048))
+	keyID, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2048))
 	if err != nil {
 		http.Error(w, "reading body", http.StatusBadRequest)
 		return
@@ -1743,6 +1803,103 @@ func (h *Handler) serveTKAAffectedSigs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(j)
+}
+
+func (h *Handler) serveTKAGenerateRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type verifyRequest struct {
+		Keys     []tkatype.KeyID
+		ForkFrom string
+	}
+	var req verifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON for verifyRequest body", http.StatusBadRequest)
+		return
+	}
+
+	var forkFrom tka.AUMHash
+	if req.ForkFrom != "" {
+		if err := forkFrom.UnmarshalText([]byte(req.ForkFrom)); err != nil {
+			http.Error(w, "decoding fork-from: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	res, err := h.b.NetworkLockGenerateRecoveryAUM(req.Keys, forkFrom)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(res.Serialize())
+}
+
+func (h *Handler) serveTKACosignRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body := io.LimitReader(r.Body, 1024*1024)
+	aumBytes, err := io.ReadAll(body)
+	if err != nil {
+		http.Error(w, "reading AUM", http.StatusBadRequest)
+		return
+	}
+	var aum tka.AUM
+	if err := aum.Unserialize(aumBytes); err != nil {
+		http.Error(w, "decoding AUM", http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.b.NetworkLockCosignRecoveryAUM(&aum)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(res.Serialize())
+}
+
+func (h *Handler) serveTKASubmitRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body := io.LimitReader(r.Body, 1024*1024)
+	aumBytes, err := io.ReadAll(body)
+	if err != nil {
+		http.Error(w, "reading AUM", http.StatusBadRequest)
+		return
+	}
+	var aum tka.AUM
+	if err := aum.Unserialize(aumBytes); err != nil {
+		http.Error(w, "decoding AUM", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.b.NetworkLockSubmitRecoveryAUM(&aum); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // serveProfiles serves profile switching-related endpoints. Supported methods
@@ -1829,6 +1986,66 @@ func (h *Handler) serveProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveQueryFeature makes a request to the "/machine/feature/query"
+// Noise endpoint to get instructions on how to enable a feature, such as
+// Funnel, for the node's tailnet.
+//
+// This request itself does not directly enable the feature on behalf of
+// the node, but rather returns information that can be presented to the
+// acting user about where/how to enable the feature. If relevant, this
+// includes a control URL the user can visit to explicitly consent to
+// using the feature.
+//
+// See tailcfg.QueryFeatureResponse for full response structure.
+func (h *Handler) serveQueryFeature(w http.ResponseWriter, r *http.Request) {
+	feature := r.FormValue("feature")
+	switch {
+	case !h.PermitRead:
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	case r.Method != httpm.POST:
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	case feature == "":
+		http.Error(w, "missing feature", http.StatusInternalServerError)
+		return
+	}
+	nm := h.b.NetMap()
+	if nm == nil {
+		http.Error(w, "no netmap", http.StatusServiceUnavailable)
+		return
+	}
+
+	b, err := json.Marshal(&tailcfg.QueryFeatureRequest{
+		NodeKey: nm.NodeKey,
+		Feature: feature,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(),
+		"POST", "https://unused/machine/feature/query", bytes.NewReader(b))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := h.b.DoNoiseRequest(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
 func defBool(a string, def bool) bool {
 	if a == "" {
 		return def
@@ -1887,7 +2104,7 @@ func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
 	// opting-out of rate limits. Limit ourselves to at most one message
 	// per 20ms and a burst of 60 log lines, which should be fast enough to
 	// not block for too long but slow enough that we can upload all lines.
-	logf = logger.SlowLoggerWithClock(r.Context(), logf, 20*time.Millisecond, 60, time.Now)
+	logf = logger.SlowLoggerWithClock(r.Context(), logf, 20*time.Millisecond, 60, h.clock.Now)
 
 	for _, line := range logRequest.Lines {
 		logf("%s", line)

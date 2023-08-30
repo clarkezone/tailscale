@@ -112,11 +112,11 @@ func TestContainerBoot(t *testing.T) {
 	runningNotify := &ipn.Notify{
 		State: ptr.To(ipn.Running),
 		NetMap: &netmap.NetworkMap{
-			SelfNode: &tailcfg.Node{
-				StableID: tailcfg.StableNodeID("myID"),
-				Name:     "test-node.test.ts.net",
-			},
-			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			SelfNode: (&tailcfg.Node{
+				StableID:  tailcfg.StableNodeID("myID"),
+				Name:      "test-node.test.ts.net",
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			}).View(),
 		},
 	}
 	tests := []struct {
@@ -359,6 +359,7 @@ func TestContainerBoot(t *testing.T) {
 						"authkey":     "tskey-key",
 						"device_fqdn": "test-node.test.ts.net",
 						"device_id":   "myID",
+						"device_ips":  `["100.64.0.1"]`,
 					},
 				},
 			},
@@ -447,6 +448,7 @@ func TestContainerBoot(t *testing.T) {
 					WantKubeSecret: map[string]string{
 						"device_fqdn": "test-node.test.ts.net",
 						"device_id":   "myID",
+						"device_ips":  `["100.64.0.1"]`,
 					},
 				},
 			},
@@ -476,23 +478,25 @@ func TestContainerBoot(t *testing.T) {
 						"authkey":     "tskey-key",
 						"device_fqdn": "test-node.test.ts.net",
 						"device_id":   "myID",
+						"device_ips":  `["100.64.0.1"]`,
 					},
 				},
 				{
 					Notify: &ipn.Notify{
 						State: ptr.To(ipn.Running),
 						NetMap: &netmap.NetworkMap{
-							SelfNode: &tailcfg.Node{
-								StableID: tailcfg.StableNodeID("newID"),
-								Name:     "new-name.test.ts.net",
-							},
-							Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
 						},
 					},
 					WantKubeSecret: map[string]string{
 						"authkey":     "tskey-key",
 						"device_fqdn": "new-name.test.ts.net",
 						"device_id":   "newID",
+						"device_ips":  `["100.64.0.1"]`,
 					},
 				},
 			},

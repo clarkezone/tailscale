@@ -19,14 +19,12 @@ import (
 
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
-	"golang.org/x/exp/maps"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/flowtrack"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/sockstats"
@@ -42,6 +40,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/mak"
@@ -304,9 +303,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 	logf("link state: %+v", e.netMon.InterfaceState())
 
-	unregisterMonWatch := e.netMon.RegisterChangeCallback(func(changed bool, st *interfaces.State) {
+	unregisterMonWatch := e.netMon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
 		tshttpproxy.InvalidateCache()
-		e.linkChange(changed, st)
+		e.linkChange(delta)
 	})
 	closePool.addFunc(unregisterMonWatch)
 	e.netMonUnregister = unregisterMonWatch
@@ -498,10 +497,7 @@ func forceFullWireguardConfig(numPeers int) bool {
 	if b, ok := debugTrimWireguard().Get(); ok {
 		return !b
 	}
-	if opt := controlclient.TrimWGConfig(); opt != "" {
-		return !opt.EqualBool(true)
-	}
-	return false
+	return controlclient.KeepFullWGConfig()
 }
 
 // isTrimmablePeer reports whether p is a peer that we can trim out of the
@@ -619,7 +615,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	// Don't re-alloc the map; the Go compiler optimizes map clears as of
 	// Go 1.11, so we can re-use the existing + allocated map.
 	if e.trimmedNodes != nil {
-		maps.Clear(e.trimmedNodes)
+		clear(e.trimmedNodes)
 	} else {
 		e.trimmedNodes = make(map[key.NodePublic]bool)
 	}
@@ -759,18 +755,19 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 
 // hasOverlap checks if there is a IPPrefix which is common amongst the two
 // provided slices.
-func hasOverlap(aips, rips []netip.Prefix) bool {
-	for _, aip := range aips {
-		for _, rip := range rips {
-			if aip == rip {
-				return true
-			}
+func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
+	for i := range aips.LenIter() {
+		aip := aips.At(i)
+		if views.SliceContains(rips, aip) {
+			return true
 		}
 	}
 	return false
 }
 
-func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
+var randomizeClientPort = controlclient.RandomizeClientPort
+
+func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
 	}
@@ -796,15 +793,15 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	e.mu.Unlock()
 
 	listenPort := e.confListenPort
-	if debug != nil && debug.RandomizeClientPort {
+	if randomizeClientPort() {
 		listenPort = 0
 	}
 
 	isSubnetRouter := false
-	if e.birdClient != nil && nm != nil && nm.SelfNode != nil {
-		isSubnetRouter = hasOverlap(nm.SelfNode.PrimaryRoutes, nm.Hostinfo.RoutableIPs)
+	if e.birdClient != nil && nm != nil && nm.SelfNode.Valid() {
+		isSubnetRouter = hasOverlap(nm.SelfNode.PrimaryRoutes(), nm.SelfNode.Hostinfo().RoutableIPs())
 		e.logf("[v1] Reconfig: hasOverlap(%v, %v) = %v; isSubnetRouter=%v lastIsSubnetRouter=%v",
-			nm.SelfNode.PrimaryRoutes, nm.Hostinfo.RoutableIPs,
+			nm.SelfNode.PrimaryRoutes(), nm.SelfNode.Hostinfo().RoutableIPs(),
 			isSubnetRouter, isSubnetRouter, e.lastIsSubnetRouter)
 	}
 	isSubnetRouterChanged := isSubnetRouter != e.lastIsSubnetRouter
@@ -1101,7 +1098,9 @@ func (e *userspaceEngine) LinkChange(_ bool) {
 	e.netMon.InjectEvent()
 }
 
-func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
+func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
+	changed := delta.Major // TODO(bradfitz): ask more specific questions?
+	cur := delta.New
 	up := cur.AnyInterfaceUp()
 	if !up {
 		e.logf("LinkChange: all links down; pausing: %v", cur)
@@ -1211,7 +1210,7 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	e.magicConn.UpdateStatus(sb)
 }
 
-func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
 	res := &ipnstate.PingResult{IP: ip.String()}
 	pip, ok := e.PeerForIP(ip)
 	if !ok {
@@ -1228,10 +1227,10 @@ func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, cb func
 	}
 	peer := pip.Node
 
-	e.logf("ping(%v): sending %v ping to %v %v ...", ip, pingType, peer.Key.ShortString(), peer.ComputedName)
+	e.logf("ping(%v): sending %v ping to %v %v ...", ip, pingType, peer.Key().ShortString(), peer.ComputedName())
 	switch pingType {
 	case "disco":
-		e.magicConn.Ping(peer, res, cb)
+		e.magicConn.Ping(peer, res, size, cb)
 	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
 	case "ICMP":
@@ -1256,7 +1255,7 @@ func (e *userspaceEngine) mySelfIPMatchingFamily(dst netip.Addr) (src netip.Addr
 	return netip.Addr{}, errors.New("no self address in netmap matching address family")
 }
 
-func (e *userspaceEngine) sendICMPEchoRequest(destIP netip.Addr, peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) sendICMPEchoRequest(destIP netip.Addr, peer tailcfg.NodeView, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
 	srcIP, err := e.mySelfIPMatchingFamily(destIP)
 	if err != nil {
 		res.Err = err.Error()
@@ -1297,7 +1296,7 @@ func (e *userspaceEngine) sendICMPEchoRequest(destIP netip.Addr, peer *tailcfg.N
 		d := time.Since(t0)
 		res.LatencySeconds = d.Seconds()
 		res.NodeIP = destIP.String()
-		res.NodeName = peer.ComputedName
+		res.NodeName = peer.ComputedName()
 		cb(res)
 	})
 
@@ -1305,7 +1304,7 @@ func (e *userspaceEngine) sendICMPEchoRequest(destIP netip.Addr, peer *tailcfg.N
 	e.tundev.InjectOutbound(icmpPing)
 }
 
-func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
 	srcIP, err := e.mySelfIPMatchingFamily(ip)
 	if err != nil {
 		res.Err = err.Error()
@@ -1339,7 +1338,7 @@ func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer *tailcfg.Node, res *i
 		d := time.Since(t0)
 		res.LatencySeconds = d.Seconds()
 		res.NodeIP = ip.String()
-		res.NodeName = peer.ComputedName
+		res.NodeName = peer.ComputedName()
 		res.PeerAPIPort = pong.PeerAPIPort
 		cb(res)
 	})
@@ -1438,7 +1437,8 @@ func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	// Check for exact matches before looking for subnet matches.
 	// TODO(bradfitz): add maps for these. on NetworkMap?
 	for _, p := range nm.Peers {
-		for _, a := range p.Addresses {
+		for i := range p.Addresses().LenIter() {
+			a := p.Addresses().At(i)
 			if a.Addr() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
 				return PeerForIP{Node: p, Route: a}, true
 			}
@@ -1471,7 +1471,7 @@ func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	// call. But TODO(bradfitz): add a lookup map to netmap.NetworkMap.
 	if !bestKey.IsZero() {
 		for _, p := range nm.Peers {
-			if p.Key == bestKey {
+			if p.Key() == bestKey {
 				return PeerForIP{Node: p, Route: best}, true
 			}
 		}

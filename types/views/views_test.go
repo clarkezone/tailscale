@@ -16,10 +16,10 @@ import (
 
 type viewStruct struct {
 	Int        int
-	Addrs      IPPrefixSlice
+	Addrs      Slice[netip.Prefix]
 	Strings    Slice[string]
-	AddrsPtr   *IPPrefixSlice `json:",omitempty"`
-	StringsPtr *Slice[string] `json:",omitempty"`
+	AddrsPtr   *Slice[netip.Prefix] `json:",omitempty"`
+	StringsPtr *Slice[string]       `json:",omitempty"`
 }
 
 func BenchmarkSliceIteration(b *testing.B) {
@@ -66,7 +66,7 @@ func TestViewsJSON(t *testing.T) {
 		}
 		return
 	}
-	ipp := IPPrefixSliceOf(mustCIDR("192.168.0.0/24"))
+	ipp := SliceOf(mustCIDR("192.168.0.0/24"))
 	ss := SliceOf([]string{"bar"})
 	tests := []struct {
 		name     string
@@ -137,4 +137,30 @@ func TestViewUtils(t *testing.T) {
 		SliceOf([]string{"a", "b", "c"}).Slice(1, 2),
 		SliceOf([]string{"b", "c"}).SliceTo(1)),
 		qt.Equals, true)
+}
+
+func TestLenIter(t *testing.T) {
+	orig := []string{"foo", "bar"}
+	var got []string
+	v := SliceOf(orig)
+	for i := range v.LenIter() {
+		got = append(got, v.At(i))
+	}
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("got %q; want %q", got, orig)
+	}
+}
+
+func TestSliceEqual(t *testing.T) {
+	a := SliceOf([]string{"foo", "bar"})
+	b := SliceOf([]string{"foo", "bar"})
+	if !SliceEqual(a, b) {
+		t.Errorf("got a != b")
+	}
+	if !SliceEqual(a.SliceTo(0), b.SliceTo(0)) {
+		t.Errorf("got a[:0] != b[:0]")
+	}
+	if SliceEqual(a.SliceTo(2), a.SliceTo(1)) {
+		t.Error("got a[:2] == a[:1]")
+	}
 }

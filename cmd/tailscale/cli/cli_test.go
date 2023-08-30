@@ -18,8 +18,10 @@ import (
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstest"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/cmpx"
@@ -834,7 +836,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env: upCheckEnv{
 				backendState: "Stopped",
@@ -846,7 +848,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env:            upCheckEnv{backendState: "Running"},
 			wantSimpleUp:   true,
@@ -857,7 +859,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--reset"},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env: upCheckEnv{backendState: "Running"},
 			wantJustEditMP: &ipn.MaskedPrefs{
@@ -884,7 +886,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: "https://login.tailscale.com",
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env:            upCheckEnv{backendState: "Running"},
 			wantSimpleUp:   true,
@@ -895,7 +897,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--login-server=https://localhost:1000"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -910,7 +912,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--advertise-tags=tag:foo"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -944,7 +946,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--ssh"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -965,7 +967,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--ssh=false"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				RunSSH:           true,
@@ -990,7 +992,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -1014,7 +1016,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -1037,7 +1039,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -1059,7 +1061,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				RunSSH:           true,
@@ -1150,16 +1152,11 @@ func TestUpdatePrefs(t *testing.T) {
 				justEditMP.Prefs = ipn.Prefs{} // uninteresting
 			}
 			if !reflect.DeepEqual(justEditMP, tt.wantJustEditMP) {
-				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was \n%v", asJSON(oldEditPrefs))
+				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was \n%v", logger.AsJSON(oldEditPrefs))
 				t.Fatalf("justEditMP: %v\n\n: ", cmp.Diff(justEditMP, tt.wantJustEditMP, cmpIP))
 			}
 		})
 	}
-}
-
-func asJSON(v any) string {
-	b, _ := json.MarshalIndent(v, "", "\t")
-	return string(b)
 }
 
 var cmpIP = cmp.Comparer(func(a, b netip.Addr) bool {

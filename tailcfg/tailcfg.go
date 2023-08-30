@@ -3,7 +3,7 @@
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile --clonefunc
 
 import (
 	"bytes"
@@ -21,6 +21,7 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/cmpx"
 	"tailscale.com/util/dnsname"
 )
 
@@ -105,7 +106,12 @@ type CapabilityVersion int
 //   - 65: 2023-07-12: Client understands DERPMap.HomeParams + incremental DERPMap updates with params
 //   - 66: 2023-07-23: UserProfile.Groups added (available via WhoIs)
 //   - 67: 2023-07-25: Client understands PeerCapMap
-const CurrentCapabilityVersion CapabilityVersion = 67
+//   - 68: 2023-08-09: Client has dedicated updateRoutine; MapRequest.Stream true means ignore Hostinfo+Endpoints
+//   - 69: 2023-08-16: removed Debug.LogHeap* + GoroutineDumpURL; added c2n /debug/logheap
+//   - 70: 2023-08-16: removed most Debug fields; added NodeAttrDisable*, NodeAttrDebug* instead
+//   - 71: 2023-08-17: added NodeAttrOneCGNATEnable, NodeAttrOneCGNATDisable
+//   - 72: 2023-08-23: TS-2023-006 UPnP issue fixed; UPnP can now be used again
+const CurrentCapabilityVersion CapabilityVersion = 72
 
 type StableID string
 
@@ -151,7 +157,6 @@ type User struct {
 	LoginName     string `json:"-"` // not stored, filled from Login // TODO REMOVE
 	DisplayName   string // if non-empty overrides Login field
 	ProfilePicURL string // if non-empty overrides Login field
-	Domain        string
 	Logins        []LoginID
 	Created       time.Time
 }
@@ -163,7 +168,6 @@ type Login struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Domain        string
 }
 
 // A UserProfile is display-friendly data for a user.
@@ -221,9 +225,9 @@ type Node struct {
 	// e.g. "host.tail-scale.ts.net."
 	Name string
 
-	// User is the user who created the node. If ACL tags are in
-	// use for the node then it doesn't reflect the ACL identity
-	// that the node is running as.
+	// User is the user who created the node. If ACL tags are in use for the
+	// node then it doesn't reflect the ACL identity that the node is running
+	// as.
 	User UserID
 
 	// Sharer, if non-zero, is the user who shared this node, if different than User.
@@ -383,6 +387,20 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 func (n *Node) IsTagged() bool {
 	return len(n.Tags) > 0
 }
+
+// SharerOrUser Sharer if set, else User.
+func (n *Node) SharerOrUser() UserID {
+	return cmpx.Or(n.Sharer, n.User)
+}
+
+// IsTagged reports whether the node has any tags.
+func (n NodeView) IsTagged() bool { return n.ж.IsTagged() }
+
+// DisplayName wraps Node.DisplayName.
+func (n NodeView) DisplayName(forOwner bool) string { return n.ж.DisplayName(forOwner) }
+
+// SharerOrUser wraps Node.SharerOrUser.
+func (n NodeView) SharerOrUser() UserID { return n.ж.SharerOrUser() }
 
 // InitDisplayNames computes and populates n's display name
 // fields: n.ComputedName, n.computedHostIfDifferent, and
@@ -733,6 +751,14 @@ type NetInfo struct {
 	// the control plane.
 	DERPLatency map[string]float64 `json:",omitempty"`
 
+	// FirewallMode encodes both which firewall mode was selected and why.
+	// It is Linux-specific (at least as of 2023-08-19) and is meant to help
+	// debug iptables-vs-nftables issues. The string is of the form
+	// "{nft,ift}-REASON", like "nft-forced" or "ipt-default". Empty means
+	// either not Linux or a configuration in which the host firewall rules
+	// are not managed by tailscaled.
+	FirewallMode string `json:",omitempty"`
+
 	// Update BasicallyEqual when adding fields.
 }
 
@@ -740,10 +766,10 @@ func (ni *NetInfo) String() string {
 	if ni == nil {
 		return "NetInfo(nil)"
 	}
-	return fmt.Sprintf("NetInfo{varies=%v hairpin=%v ipv6=%v ipv6os=%v udp=%v icmpv4=%v derp=#%v portmap=%v link=%q}",
+	return fmt.Sprintf("NetInfo{varies=%v hairpin=%v ipv6=%v ipv6os=%v udp=%v icmpv4=%v derp=#%v portmap=%v link=%q firewallmode=%q}",
 		ni.MappingVariesByDestIP, ni.HairPinning, ni.WorkingIPv6,
 		ni.OSHasIPv6, ni.WorkingUDP, ni.WorkingICMPv4,
-		ni.PreferredDERP, ni.portMapSummary(), ni.LinkType)
+		ni.PreferredDERP, ni.portMapSummary(), ni.LinkType, ni.FirewallMode)
 }
 
 func (ni *NetInfo) portMapSummary() string {
@@ -791,7 +817,8 @@ func (ni *NetInfo) BasicallyEqual(ni2 *NetInfo) bool {
 		ni.PMP == ni2.PMP &&
 		ni.PCP == ni2.PCP &&
 		ni.PreferredDERP == ni2.PreferredDERP &&
-		ni.LinkType == ni2.LinkType
+		ni.LinkType == ni2.LinkType &&
+		ni.FirewallMode == ni2.FirewallMode
 }
 
 // Equal reports whether h and h2 are equal.
@@ -932,6 +959,16 @@ func (st SignatureType) String() string {
 	}
 }
 
+// RegisterResponseAuth is the authentication information returned by the server
+// in response to a RegisterRequest.
+type RegisterResponseAuth struct {
+	_ structs.Incomparable
+	// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
+	Provider, LoginName string
+	Oauth2Token         *Oauth2Token
+	AuthKey             string
+}
+
 // RegisterRequest is sent by a client to register the key for a node.
 // It is encoded to JSON, encrypted with golang.org/x/crypto/nacl/box,
 // using the local machine key, and sent to:
@@ -950,13 +987,7 @@ type RegisterRequest struct {
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
 	NLKey      key.NLPublic
-	Auth       struct {
-		_ structs.Incomparable
-		// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
-		Provider, LoginName string
-		Oauth2Token         *Oauth2Token
-		AuthKey             string
-	}
+	Auth       RegisterResponseAuth
 	// Expiry optionally specifies the requested key expiry.
 	// The server policy may override.
 	// As a special case, if Expiry is in the past and NodeKey is
@@ -983,29 +1014,6 @@ type RegisterRequest struct {
 	Timestamp     *time.Time    `json:",omitempty"` // creation time of request to prevent replay
 	DeviceCert    []byte        `json:",omitempty"` // X.509 certificate for client device
 	Signature     []byte        `json:",omitempty"` // as described by SignatureType
-}
-
-// Clone makes a deep copy of RegisterRequest.
-// The result aliases no memory with the original.
-//
-// TODO: extend cmd/cloner to generate this method.
-func (req *RegisterRequest) Clone() *RegisterRequest {
-	if req == nil {
-		return nil
-	}
-	res := new(RegisterRequest)
-	*res = *req
-	if res.Hostinfo != nil {
-		res.Hostinfo = res.Hostinfo.Clone()
-	}
-	if res.Auth.Oauth2Token != nil {
-		tok := *res.Auth.Oauth2Token
-		res.Auth.Oauth2Token = &tok
-	}
-	res.DeviceCert = append(res.DeviceCert[:0:0], res.DeviceCert...)
-	res.Signature = append(res.Signature[:0:0], res.Signature...)
-	res.NodeKeySignature = append(res.NodeKeySignature[:0:0], res.NodeKeySignature...)
-	return res
 }
 
 // RegisterResponse is returned by the server in response to a RegisterRequest.
@@ -1082,8 +1090,21 @@ type MapRequest struct {
 	NodeKey     key.NodePublic
 	DiscoKey    key.DiscoPublic
 	IncludeIPv6 bool `json:",omitempty"` // include IPv6 endpoints in returned Node Endpoints (for Version 4 clients)
-	Stream      bool // if true, multiple MapResponse objects are returned
-	Hostinfo    *Hostinfo
+
+	// Stream is whether the client wants to receive multiple MapResponses over
+	// the same HTTP connection.
+	//
+	// If false, the server will send a single MapResponse and then close the
+	// connection.
+	//
+	// If true and Version >= 68, the server should treat this as a read-only
+	// request and ignore any Hostinfo or other fields that might be set.
+	Stream bool
+
+	// Hostinfo is the client's current Hostinfo. Although it is always included
+	// in the request, the server may choose to ignore it when Stream is true
+	// and Version >= 68.
+	Hostinfo *Hostinfo
 
 	// MapSessionHandle, if non-empty, is a request to reattach to a previous
 	// map session after a previous map session was interrupted for whatever
@@ -1105,6 +1126,7 @@ type MapRequest struct {
 	MapSessionSeq int64 `json:",omitempty"`
 
 	// Endpoints are the client's magicsock UDP ip:port endpoints (IPv4 or IPv6).
+	// These can be ignored if Stream is true and Version >= 68.
 	Endpoints []string
 	// EndpointTypes are the types of the corresponding endpoints in Endpoints.
 	EndpointTypes []EndpointType `json:",omitempty"`
@@ -1114,13 +1136,12 @@ type MapRequest struct {
 	// It is encoded as tka.AUMHash.MarshalText.
 	TKAHead string `json:",omitempty"`
 
-	// ReadOnly is whether the client just wants to fetch the
-	// MapResponse, without updating their Endpoints. The
-	// Endpoints field will be ignored and LastSeen will not be
-	// updated and peers will not be notified of changes.
+	// ReadOnly was set when client just wanted to fetch the MapResponse,
+	// without updating their Endpoints. The intended use was for clients to
+	// discover the DERP map at start-up before their first real endpoint
+	// update.
 	//
-	// The intended use is for clients to discover the DERP map at
-	// start-up before their first real endpoint update.
+	// Deprecated: always false as of Version 68.
 	ReadOnly bool `json:",omitempty"`
 
 	// OmitPeers is whether the client is okay with the Peers list being omitted
@@ -1222,6 +1243,25 @@ const (
 // The values are opaque to Tailscale, but are passed through from the ACLs to
 // the application via the WhoIs API.
 type PeerCapMap map[PeerCapability][]json.RawMessage
+
+// UnmarshalCapJSON unmarshals each JSON value in cm[cap] as T.
+// If cap does not exist in cm, it returns (nil, nil).
+// It returns an error if the values cannot be unmarshaled into the provided type.
+func UnmarshalCapJSON[T any](cm PeerCapMap, cap PeerCapability) ([]T, error) {
+	vals, ok := cm[cap]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]T, 0, len(vals))
+	for _, v := range vals {
+		var t T
+		if err := json.Unmarshal(v, &t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
 
 // HasCapability reports whether c has the capability cap.
 // This is used to test for the existence of a capability, especially
@@ -1364,6 +1404,11 @@ type DNSConfig struct {
 	//
 	// Matches are case insensitive.
 	ExitNodeFilteredSet []string `json:",omitempty"`
+
+	// TempCorpIssue13969 is a temporary (2023-08-16) field for an internal hack day prototype.
+	// It contains a user inputed URL that should have a list of domains to be blocked.
+	// See https://github.com/tailscale/corp/issues/13969.
+	TempCorpIssue13969 string `json:",omitempty"`
 }
 
 // DNSRecord is an extra DNS record to add to MagicDNS.
@@ -1695,98 +1740,28 @@ type ControlIPCandidate struct {
 	Priority int `json:",omitempty"`
 }
 
-// Debug are instructions from the control server to the client to adjust debug
-// settings.
-//
-// Deprecated: these should no longer be used. They're a weird mix of declartive
-// and imperative. The imperative ones should be c2n requests instead, and the
-// declarative ones (at least the bools) should generally be self
-// Node.Capabilities.
-//
-// TODO(bradfitz): start migrating the imperative ones to c2n requests.
+// Debug used to be a miscellaneous set of declarative debug config changes and
+// imperative debug commands. They've since been mostly migrated to node
+// attributes (MapResponse.Node.Capabilities) for the declarative things and c2n
+// requests for the imperative things. Not much remains here. Don't add more.
 type Debug struct {
-	// LogHeapPprof controls whether the client should log
-	// its heap pprof data. Each true value sent from the server
-	// means that client should do one more log.
-	LogHeapPprof bool `json:",omitempty"`
-
-	// LogHeapURL is the URL to POST its heap pprof to.
-	// Empty means to not log.
-	LogHeapURL string `json:",omitempty"`
-
-	// ForceBackgroundSTUN controls whether magicsock should
-	// always do its background STUN queries (see magicsock's
-	// periodicReSTUN), regardless of inactivity.
-	ForceBackgroundSTUN bool `json:",omitempty"`
-
-	// SetForceBackgroundSTUN controls whether magicsock should always do its
-	// background STUN queries (see magicsock's periodicReSTUN), regardless of
-	// inactivity.
-	//
-	// As of capver 37, this field is the preferred field for control to set on
-	// the wire and ForceBackgroundSTUN is only used within the code as the
-	// current map session value. But ForceBackgroundSTUN can still be used too.
-	SetForceBackgroundSTUN opt.Bool `json:",omitempty"`
-
-	// DERPRoute controls whether the DERP reverse path
-	// optimization (see Issue 150) should be enabled or
-	// disabled. The environment variable in magicsock is the
-	// highest priority (if set), then this (if set), then the
-	// binary default value.
-	DERPRoute opt.Bool `json:",omitempty"`
-
-	// TrimWGConfig controls whether Tailscale does lazy, on-demand
-	// wireguard configuration of peers.
-	TrimWGConfig opt.Bool `json:",omitempty"`
-
-	// DisableSubnetsIfPAC controls whether subnet routers should be
-	// disabled if WPAD is present on the network.
-	DisableSubnetsIfPAC opt.Bool `json:",omitempty"`
-
-	// GoroutineDumpURL, if non-empty, requests that the client do
-	// a one-time dump of its active goroutines to the given URL.
-	GoroutineDumpURL string `json:",omitempty"`
-
 	// SleepSeconds requests that the client sleep for the
 	// provided number of seconds.
 	// The client can (and should) limit the value (such as 5
-	// minutes).
+	// minutes). This exists as a safety measure to slow down
+	// spinning clients, in case we introduce a bug in the
+	// state machine.
 	SleepSeconds float64 `json:",omitempty"`
-
-	// RandomizeClientPort is whether magicsock should UDP bind to
-	// :0 to get a random local port, ignoring any configured
-	// fixed port.
-	RandomizeClientPort bool `json:",omitempty"`
-
-	// SetRandomizeClientPort is whether magicsock should UDP bind to :0 to get
-	// a random local port, ignoring any configured fixed port.
-	//
-	// As of capver 37, this field is the preferred field for control to set on
-	// the wire and RandomizeClientPort is only used within the code as the
-	// current map session value. But RandomizeClientPort can still be used too.
-	SetRandomizeClientPort opt.Bool `json:",omitempty"`
-
-	// OneCGNATRoute controls whether the client should prefer to make one
-	// big CGNAT /10 route rather than a /32 per peer.
-	OneCGNATRoute opt.Bool `json:",omitempty"`
-
-	// DisableUPnP is whether the client will attempt to perform a UPnP portmapping.
-	// By default, we want to enable it to see if it works on more clients.
-	//
-	// If UPnP catastrophically fails for people, this should be set to True to kill
-	// new attempts at UPnP connections.
-	DisableUPnP opt.Bool `json:",omitempty"`
 
 	// DisableLogTail disables the logtail package. Once disabled it can't be
 	// re-enabled for the lifetime of the process.
+	//
+	// This is primarily used by Headscale.
 	DisableLogTail bool `json:",omitempty"`
 
-	// EnableSilentDisco disables the use of heartBeatTimer in magicsock and attempts to
-	// handle disco silently. See issue #540 for details.
-	EnableSilentDisco bool `json:",omitempty"`
-
 	// Exit optionally specifies that the client should os.Exit
-	// with this code.
+	// with this code. This is a safety measure in case a client is crash
+	// looping or in an unsafe state and we need to remotely shut it down.
 	Exit *int `json:",omitempty"`
 }
 
@@ -1921,6 +1896,7 @@ const (
 	CapabilitySSHRuleIn          = "https://tailscale.com/cap/ssh-rule-in"           // some SSH rule reach this node
 	CapabilityDataPlaneAuditLogs = "https://tailscale.com/cap/data-plane-audit-logs" // feature enabled
 	CapabilityDebug              = "https://tailscale.com/cap/debug"                 // exposes debug endpoints over the PeerAPI
+	CapabilityHTTPS              = "https"                                           // https cert provisioning enabled on tailnet
 
 	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
 	// sockets (in the net/netns package). See that package for more
@@ -1944,10 +1920,11 @@ const (
 	// Funnel warning capabilities used for reporting errors to the user.
 
 	// CapabilityWarnFunnelNoInvite indicates whether Funnel is enabled for the tailnet.
-	// NOTE: In transition from Alpha to Beta, this capability is being reused as the enablement.
+	// This cap is no longer used 2023-08-09 onwards.
 	CapabilityWarnFunnelNoInvite = "https://tailscale.com/cap/warn-funnel-no-invite"
 
 	// CapabilityWarnFunnelNoHTTPS indicates HTTPS has not been enabled for the tailnet.
+	// This cap is no longer used 2023-08-09 onwards.
 	CapabilityWarnFunnelNoHTTPS = "https://tailscale.com/cap/warn-funnel-no-https"
 
 	// Debug logging capabilities
@@ -1969,6 +1946,44 @@ const (
 	NodeAttrFunnel = "funnel"
 	// NodeAttrSSHAggregator grants the ability for a node to collect SSH sessions.
 	NodeAttrSSHAggregator = "ssh-aggregator"
+
+	// NodeAttrDebugForceBackgroundSTUN forces a node to always do background
+	// STUN queries regardless of inactivity.
+	NodeAttrDebugForceBackgroundSTUN = "debug-always-stun"
+
+	// NodeAttrDebugDisableWGTrim disables the lazy WireGuard configuration,
+	// always giving WireGuard the full netmap, even for idle peers.
+	NodeAttrDebugDisableWGTrim = "debug-no-wg-trim"
+
+	// NodeAttrDebugDisableDRPO disables the DERP Return Path Optimization.
+	// See Issue 150.
+	NodeAttrDebugDisableDRPO = "debug-disable-drpo"
+
+	// NodeAttrDisableSubnetsIfPAC controls whether subnet routers should be
+	// disabled if WPAD is present on the network.
+	NodeAttrDisableSubnetsIfPAC = "debug-disable-subnets-if-pac"
+
+	// NodeAttrDisableUPnP makes the client not perform a UPnP portmapping.
+	// By default, we want to enable it to see if it works on more clients.
+	//
+	// If UPnP catastrophically fails for people, this should be set kill
+	// new attempts at UPnP connections.
+	NodeAttrDisableUPnP = "debug-disable-upnp"
+
+	// NodeAttrRandomizeClientPort makes magicsock UDP bind to
+	// :0 to get a random local port, ignoring any configured
+	// fixed port.
+	NodeAttrRandomizeClientPort = "randomize-client-port"
+
+	// NodeAttrOneCGNATEnable makes the client prefer one big CGNAT /10 route
+	// rather than a /32 per peer. At most one of this or
+	// NodeAttrOneCGNATDisable may be set; if neither are, it's automatic.
+	NodeAttrOneCGNATEnable = "one-cgnat?v=true"
+
+	// NodeAttrOneCGNATDisable makes the client prefer a /32 route per peer
+	// rather than one big /10 CGNAT route. At most one of this or
+	// NodeAttrOneCGNATEnable may be set; if neither are, it's automatic.
+	NodeAttrOneCGNATDisable = "one-cgnat?v=false"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2237,6 +2252,51 @@ type SSHRecordingAttempt struct {
 	FailureMessage string
 }
 
+// QueryFeatureRequest is a request sent to "/machine/feature/query"
+// to get instructions on how to enable a feature, such as Funnel,
+// for the node's tailnet.
+//
+// See QueryFeatureResponse for response structure.
+type QueryFeatureRequest struct {
+	// Feature is the string identifier for a feature.
+	Feature string `json:",omitempty"`
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic `json:",omitempty"`
+}
+
+// QueryFeatureResponse is the response to an QueryFeatureRequest.
+// See cli.enableFeatureInteractive for usage.
+type QueryFeatureResponse struct {
+	// Complete is true when the feature is already enabled.
+	Complete bool `json:",omitempty"`
+
+	// Text holds lines to display in the CLI with information
+	// about the feature and how to enable it.
+	//
+	// Lines are separated by newline characters. The final
+	// newline may be omitted.
+	Text string `json:",omitempty"`
+
+	// URL is the link for the user to visit to take action on
+	// enabling the feature.
+	//
+	// When empty, there is no action for this user to take.
+	URL string `json:",omitempty"`
+
+	// ShouldWait specifies whether the CLI should block and
+	// wait for the user to enable the feature.
+	//
+	// If this is true, the enablement from the control server
+	// is expected to be a quick and uninterrupted process for
+	// the user, and blocking allows them to immediately start
+	// using the feature once enabled without rerunning the
+	// command (e.g. no need to re-run "funnel on").
+	//
+	// The CLI can watch the IPN notification bus for changes in
+	// required node capabilities to know when to continue.
+	ShouldWait bool `json:",omitempty"`
+}
+
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>
 // over HTTPS (regular TLS) to the Tailscale control plane server,
 // where the 'v' argument is the client's current capability version
@@ -2350,6 +2410,8 @@ type PeerChange struct {
 //
 // Mnemonic: 3.3.40 are numbers above the keys D, E, R, P.
 const DerpMagicIP = "127.3.3.40"
+
+var DerpMagicIPAddr = netip.MustParseAddr(DerpMagicIP)
 
 // EarlyNoise is the early payload that's sent over Noise but before the HTTP/2
 // handshake when connecting to the coordination server.

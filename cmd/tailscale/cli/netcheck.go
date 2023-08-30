@@ -21,6 +21,7 @@ import (
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
@@ -52,7 +53,6 @@ func runNetcheck(ctx context.Context, args []string) error {
 		return err
 	}
 	c := &netcheck.Client{
-		UDPBindAddr: envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"),
 		PortMapper:  portmapper.NewClient(logf, netMon, nil, nil),
 		UseDNSCache: false, // always resolve, don't cache
 	}
@@ -67,13 +67,18 @@ func runNetcheck(ctx context.Context, args []string) error {
 		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
 	}
 
+	if err := c.Standalone(ctx, envknob.String("TS_DEBUG_NETCHECK_UDP_BIND")); err != nil {
+		fmt.Fprintln(Stderr, "netcheck: UDP test failure:", err)
+	}
+
 	dm, err := localClient.CurrentDERPMap(ctx)
 	noRegions := dm != nil && len(dm.Regions) == 0
 	if noRegions {
 		log.Printf("No DERP map from tailscaled; using default.")
 	}
 	if err != nil || noRegions {
-		dm, err = prodDERPMap(ctx, http.DefaultClient)
+		hc := &http.Client{Transport: tlsdial.NewTransport()}
+		dm, err = prodDERPMap(ctx, hc)
 		if err != nil {
 			return err
 		}

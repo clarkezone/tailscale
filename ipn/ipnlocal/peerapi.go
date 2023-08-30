@@ -22,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +33,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/kortschak/wol"
-	"golang.org/x/exp/slices"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
 	"tailscale.com/client/tailscale/apitype"
@@ -47,6 +47,7 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/multierr"
 	"tailscale.com/version/distro"
@@ -304,7 +305,7 @@ func (s *peerAPIServer) DeleteFile(baseName string) error {
 	}
 	var bo *backoff.Backoff
 	logf := s.b.logf
-	t0 := time.Now()
+	t0 := s.b.clock.Now()
 	for {
 		err := os.Remove(path)
 		if err != nil && !os.IsNotExist(err) {
@@ -323,7 +324,7 @@ func (s *peerAPIServer) DeleteFile(baseName string) error {
 				if bo == nil {
 					bo = backoff.NewBackoff("delete-retry", logf, 1*time.Second)
 				}
-				if time.Since(t0) < 5*time.Second {
+				if s.b.clock.Since(t0) < 5*time.Second {
 					bo.BackOff(context.Background(), err)
 					continue
 				}
@@ -569,14 +570,14 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		return
 	}
 	nm := pln.lb.NetMap()
-	if nm == nil || nm.SelfNode == nil {
+	if nm == nil || !nm.SelfNode.Valid() {
 		logf("peerapi: no netmap")
 		c.Close()
 		return
 	}
 	h := &peerAPIHandler{
 		ps:         pln.ps,
-		isSelf:     nm.SelfNode.User == peerNode.User,
+		isSelf:     nm.SelfNode.User() == peerNode.User(),
 		remoteAddr: src,
 		selfNode:   nm.SelfNode,
 		peerNode:   peerNode,
@@ -596,8 +597,8 @@ type peerAPIHandler struct {
 	ps         *peerAPIServer
 	remoteAddr netip.AddrPort
 	isSelf     bool                // whether peerNode is owned by same user as this node
-	selfNode   *tailcfg.Node       // this node; always non-nil
-	peerNode   *tailcfg.Node       // peerNode is who's making the request
+	selfNode   tailcfg.NodeView    // this node; always non-nil
+	peerNode   tailcfg.NodeView    // peerNode is who's making the request
 	peerUser   tailcfg.UserProfile // profile of peerNode
 }
 
@@ -608,11 +609,11 @@ func (h *peerAPIHandler) logf(format string, a ...any) {
 // isAddressValid reports whether addr is a valid destination address for this
 // node originating from the peer.
 func (h *peerAPIHandler) isAddressValid(addr netip.Addr) bool {
-	if h.peerNode.SelfNodeV4MasqAddrForThisPeer != nil {
-		return *h.peerNode.SelfNodeV4MasqAddrForThisPeer == addr
+	if v := h.peerNode.SelfNodeV4MasqAddrForThisPeer(); v != nil {
+		return *v == addr
 	}
 	pfx := netip.PrefixFrom(addr, addr.BitLen())
-	return slices.Contains(h.selfNode.Addresses, pfx)
+	return views.SliceContains(h.selfNode.Addresses(), pfx)
 }
 
 func (h *peerAPIHandler) validateHost(r *http.Request) error {
@@ -733,7 +734,7 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 <body>
 <h1>Hello, %s (%v)</h1>
 This is my Tailscale device. Your device is %v.
-`, html.EscapeString(who), h.remoteAddr.Addr(), html.EscapeString(h.peerNode.ComputedName))
+`, html.EscapeString(who), h.remoteAddr.Addr(), html.EscapeString(h.peerNode.ComputedName()))
 
 	if h.isSelf {
 		fmt.Fprintf(w, "<p>You are the owner of this node.\n")
@@ -902,8 +903,8 @@ func (h *peerAPIHandler) handleServeSockStats(w http.ResponseWriter, r *http.Req
 	for label := range stats.Stats {
 		labels = append(labels, label)
 	}
-	slices.SortFunc(labels, func(a, b sockstats.Label) bool {
-		return a.String() < b.String()
+	slices.SortFunc(labels, func(a, b sockstats.Label) int {
+		return strings.Compare(a.String(), b.String())
 	})
 
 	txTotal := uint64(0)
@@ -1000,7 +1001,7 @@ func (f *incomingFile) Write(p []byte) (n int, err error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.copied += int64(n)
-		now := time.Now()
+		now := b.clock.Now()
 		if f.lastNotify.IsZero() || now.Sub(f.lastNotify) > time.Second {
 			f.lastNotify = now
 			needNotify = true
@@ -1024,7 +1025,7 @@ func (f *incomingFile) PartialFile() ipn.PartialFile {
 
 // canPutFile reports whether h can put a file ("Taildrop") to this node.
 func (h *peerAPIHandler) canPutFile() bool {
-	if h.peerNode.UnsignedPeerAPIOnly {
+	if h.peerNode.UnsignedPeerAPIOnly() {
 		// Unsigned peers can't send files.
 		return false
 	}
@@ -1034,11 +1035,11 @@ func (h *peerAPIHandler) canPutFile() bool {
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
-	if !slices.Contains(h.selfNode.Capabilities, tailcfg.CapabilityDebug) {
+	if !views.SliceContains(h.selfNode.Capabilities(), tailcfg.CapabilityDebug) {
 		// This node does not expose debug info.
 		return false
 	}
-	if h.peerNode.UnsignedPeerAPIOnly {
+	if h.peerNode.UnsignedPeerAPIOnly() {
 		// Unsigned peers can't debug.
 		return false
 	}
@@ -1047,7 +1048,7 @@ func (h *peerAPIHandler) canDebug() bool {
 
 // canWakeOnLAN reports whether h can send a Wake-on-LAN packet from this node.
 func (h *peerAPIHandler) canWakeOnLAN() bool {
-	if h.peerNode.UnsignedPeerAPIOnly {
+	if h.peerNode.UnsignedPeerAPIOnly() {
 		return false
 	}
 	return h.isSelf || h.peerHasCap(tailcfg.PeerCapabilityWakeOnLAN)
@@ -1113,7 +1114,7 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad filename", 400)
 		return
 	}
-	t0 := time.Now()
+	t0 := h.ps.b.clock.Now()
 	// TODO(bradfitz): prevent same filename being sent by two peers at once
 	partialFile := dstFile + partialSuffix
 	f, err := os.Create(partialFile)
@@ -1133,7 +1134,7 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength != 0 {
 		inFile = &incomingFile{
 			name:    baseName,
-			started: time.Now(),
+			started: h.ps.b.clock.Now(),
 			size:    r.ContentLength,
 			w:       f,
 			ph:      h,
@@ -1171,7 +1172,7 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	d := time.Since(t0).Round(time.Second / 10)
+	d := h.ps.b.clock.Since(t0).Round(time.Second / 10)
 	h.logf("got put of %s in %v from %v/%v", approxSize(finalSize), d, h.remoteAddr.Addr(), h.peerNode.ComputedName)
 
 	// TODO: set modtime
@@ -1282,8 +1283,8 @@ func (h *peerAPIHandler) handleWakeOnLAN(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var password []byte // TODO(bradfitz): support?
-	st, err := interfaces.GetState()
-	if err != nil {
+	st := h.ps.b.sys.NetMon.Get().InterfaceState()
+	if st == nil {
 		http.Error(w, "failed to get interfaces state", http.StatusInternalServerError)
 		return
 	}

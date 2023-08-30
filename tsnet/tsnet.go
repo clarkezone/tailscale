@@ -12,7 +12,6 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -23,12 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -52,12 +51,12 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 )
-
-func inTest() bool { return flag.Lookup("test.v") != nil }
 
 // Server is an embedded Tailscale server.
 //
@@ -605,7 +604,7 @@ func (s *Server) start() (reterr error) {
 }
 
 func (s *Server) startLogger(closePool *closeOnErrorPool) error {
-	if inTest() {
+	if testenv.InTest() {
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
@@ -641,7 +640,8 @@ func (s *Server) startLogger(closePool *closeOnErrorPool) error {
 			}
 			return w
 		},
-		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, s.logf)},
+		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, s.logf)},
+		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}
 	s.logtail = logtail.NewLogger(c, s.logf)
 	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
@@ -930,6 +930,10 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	if err != nil {
 		return nil, err
 	}
+	// TODO(sonia,tailscale/corp#10577): We may want to use the interactive enable
+	// flow here instead of CheckFunnelAccess to allow the user to turn on Funnel
+	// if not already on. Specifically when running from a terminal.
+	// See cli.serveEnv.verifyFunnelEnabled.
 	if err := ipn.CheckFunnelAccess(uint16(port), st.Self.Capabilities); err != nil {
 		return nil, err
 	}

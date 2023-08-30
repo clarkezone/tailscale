@@ -11,9 +11,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"unicode/utf8"
-
-	"golang.org/x/exp/slices"
 )
 
 // PrivateID represents a log steam for writing.
@@ -84,7 +83,11 @@ func (id PublicID) String() string {
 }
 
 func (id1 PublicID) Less(id2 PublicID) bool {
-	return slices.Compare(id1[:], id2[:]) < 0
+	return id1.Compare(id2) < 0
+}
+
+func (id1 PublicID) Compare(id2 PublicID) int {
+	return slices.Compare(id1[:], id2[:])
 }
 
 func (id PublicID) IsZero() bool {

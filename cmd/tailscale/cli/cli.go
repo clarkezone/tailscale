@@ -14,12 +14,12 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"text/tabwriter"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
@@ -120,7 +120,7 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd,
+			funnelCmd(),
 			serveCmd,
 			versionCmd,
 			webCmd,
@@ -129,6 +129,7 @@ change in the future.
 			certCmd,
 			netlockCmd,
 			licensesCmd,
+			exitNodeCmd,
 		},
 		FlagSet:   rootfs,
 		Exec:      func(context.Context, []string) error { return flag.ErrHelp },

@@ -17,12 +17,13 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
+	"github.com/google/uuid"
 	"tailscale.com/ipn"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netutil"
@@ -193,7 +194,7 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 		b.logf("netMap is nil")
 		return
 	}
-	if nm.SelfNode == nil {
+	if !nm.SelfNode.Valid() {
 		b.logf("netMap SelfNode is nil")
 		return
 	}
@@ -227,7 +228,7 @@ func (b *LocalBackend) SetServeConfig(config *ipn.ServeConfig) error {
 	if nm == nil {
 		return errors.New("netMap is nil")
 	}
-	if nm.SelfNode == nil {
+	if !nm.SelfNode.Valid() {
 		return errors.New("netMap SelfNode is nil")
 	}
 	profileID := b.pm.CurrentProfile().ID
@@ -257,7 +258,165 @@ func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
 	return b.serveConfig
 }
 
-func (b *LocalBackend) HandleIngressTCPConn(ingressPeer *tailcfg.Node, target ipn.HostPort, srcAddr netip.AddrPort, getConnOrReset func() (net.Conn, bool), sendRST func()) {
+// StreamServe opens a stream to write any incoming connections made
+// to the given HostPort out to the listening io.Writer.
+//
+// If Serve and Funnel were not already enabled for the HostPort in the ServeConfig,
+// the backend enables it for the duration of the context's lifespan and
+// then turns it back off once the context is closed. If either are already enabled,
+// then they remain that way but logs are still streamed
+func (b *LocalBackend) StreamServe(ctx context.Context, w io.Writer, req ipn.ServeStreamRequest) (err error) {
+	f, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("writer not a flusher")
+	}
+	f.Flush()
+
+	port, err := req.HostPort.Port()
+	if err != nil {
+		return err
+	}
+
+	// Turn on Funnel for the given HostPort.
+	sc := b.ServeConfig().AsStruct()
+	if sc == nil {
+		sc = &ipn.ServeConfig{}
+	}
+	setHandler(sc, req)
+	if err := b.SetServeConfig(sc); err != nil {
+		return fmt.Errorf("errro setting serve config: %w", err)
+	}
+	// Defer turning off Funnel once stream ends.
+	defer func() {
+		sc := b.ServeConfig().AsStruct()
+		deleteHandler(sc, req, port)
+		err = errors.Join(err, b.SetServeConfig(sc))
+	}()
+
+	var writeErrs []error
+	writeToStream := func(log ipn.FunnelRequestLog) {
+		jsonLog, err := json.Marshal(log)
+		if err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		if _, err := fmt.Fprintf(w, "%s\n", jsonLog); err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		f.Flush()
+	}
+
+	// Hook up connections stream.
+	b.mu.Lock()
+	mak.NonNilMapForJSON(&b.serveStreamers)
+	if b.serveStreamers[port] == nil {
+		b.serveStreamers[port] = make(map[uint32]func(ipn.FunnelRequestLog))
+	}
+	id := uuid.New().ID()
+	b.serveStreamers[port][id] = writeToStream
+	b.mu.Unlock()
+
+	// Clean up streamer when done.
+	defer func() {
+		b.mu.Lock()
+		delete(b.serveStreamers[port], id)
+		b.mu.Unlock()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Triggered by foreground `tailscale funnel` process
+		// (the streamer) getting closed, or by turning off Tailscale.
+	}
+
+	return errors.Join(writeErrs...)
+}
+
+func setHandler(sc *ipn.ServeConfig, req ipn.ServeStreamRequest) {
+	if sc.TCP == nil {
+		sc.TCP = make(map[uint16]*ipn.TCPPortHandler)
+	}
+	if _, ok := sc.TCP[443]; !ok {
+		sc.TCP[443] = &ipn.TCPPortHandler{
+			HTTPS: true,
+		}
+	}
+	if sc.Web == nil {
+		sc.Web = make(map[ipn.HostPort]*ipn.WebServerConfig)
+	}
+	wsc, ok := sc.Web[req.HostPort]
+	if !ok {
+		wsc = &ipn.WebServerConfig{}
+		sc.Web[req.HostPort] = wsc
+	}
+	if wsc.Handlers == nil {
+		wsc.Handlers = make(map[string]*ipn.HTTPHandler)
+	}
+	wsc.Handlers[req.MountPoint] = &ipn.HTTPHandler{
+		Proxy: req.Source,
+	}
+	if sc.AllowFunnel == nil {
+		sc.AllowFunnel = make(map[ipn.HostPort]bool)
+	}
+	sc.AllowFunnel[req.HostPort] = true
+}
+
+func deleteHandler(sc *ipn.ServeConfig, req ipn.ServeStreamRequest, port uint16) {
+	delete(sc.AllowFunnel, req.HostPort)
+	if sc.TCP != nil {
+		delete(sc.TCP, port)
+	}
+	if sc.Web == nil {
+		return
+	}
+	if sc.Web[req.HostPort] == nil {
+		return
+	}
+	wsc, ok := sc.Web[req.HostPort]
+	if !ok {
+		return
+	}
+	if wsc.Handlers == nil {
+		return
+	}
+	if _, ok := wsc.Handlers[req.MountPoint]; !ok {
+		return
+	}
+	delete(wsc.Handlers, req.MountPoint)
+	if len(wsc.Handlers) == 0 {
+		delete(sc.Web, req.HostPort)
+	}
+}
+
+func (b *LocalBackend) maybeLogServeConnection(destPort uint16, srcAddr netip.AddrPort) {
+	b.mu.Lock()
+	streamers := b.serveStreamers[destPort]
+	b.mu.Unlock()
+	if len(streamers) == 0 {
+		return
+	}
+
+	var log ipn.FunnelRequestLog
+	log.SrcAddr = srcAddr
+	log.Time = b.clock.Now()
+
+	if node, user, ok := b.WhoIs(srcAddr); ok {
+		log.NodeName = node.ComputedName()
+		if node.IsTagged() {
+			log.NodeTags = node.Tags().AsSlice()
+		} else {
+			log.UserLoginName = user.LoginName
+			log.UserDisplayName = user.DisplayName
+		}
+	}
+
+	for _, stream := range streamers {
+		stream(log)
+	}
+}
+
+func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target ipn.HostPort, srcAddr netip.AddrPort, getConnOrReset func() (net.Conn, bool), sendRST func()) {
 	b.mu.Lock()
 	sc := b.serveConfig
 	b.mu.Unlock()
@@ -359,6 +518,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 	if backDst := tcph.TCPForward(); backDst != "" {
 		return func(conn net.Conn) error {
 			defer conn.Close()
+			b.maybeLogServeConnection(dport, srcAddr)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
 			cancel()
@@ -372,7 +532,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 						defer cancel()
-						pair, err := b.GetCertPEM(ctx, sni)
+						pair, err := b.GetCertPEM(ctx, sni, false)
 						if err != nil {
 							return nil, err
 						}
@@ -499,6 +659,7 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	// Clear any incoming values squatting in the headers.
 	r.Out.Header.Del("Tailscale-User-Login")
 	r.Out.Header.Del("Tailscale-User-Name")
+	r.Out.Header.Del("Tailscale-User-Profile-Pic")
 	r.Out.Header.Del("Tailscale-Headers-Info")
 
 	c, ok := getServeHTTPContext(r.Out)
@@ -516,6 +677,7 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	}
 	r.Out.Header.Set("Tailscale-User-Login", user.LoginName)
 	r.Out.Header.Set("Tailscale-User-Name", user.DisplayName)
+	r.Out.Header.Set("Tailscale-User-Profile-Pic", user.ProfilePicURL)
 	r.Out.Header.Set("Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers")
 }
 
@@ -524,6 +686,9 @@ func (b *LocalBackend) serveWebHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		http.NotFound(w, r)
 		return
+	}
+	if c, ok := getServeHTTPContext(r); ok {
+		b.maybeLogServeConnection(c.DestPort, c.SrcAddr)
 	}
 	if s := h.Text(); s != "" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -675,7 +840,7 @@ func (b *LocalBackend) getTLSServeCertForPort(port uint16) func(hi *tls.ClientHe
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		pair, err := b.GetCertPEM(ctx, hi.ServerName)
+		pair, err := b.GetCertPEM(ctx, hi.ServerName, false)
 		if err != nil {
 			return nil, err
 		}

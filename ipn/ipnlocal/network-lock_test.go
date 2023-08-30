@@ -29,6 +29,12 @@ import (
 	"tailscale.com/util/must"
 )
 
+type observerFunc func(controlclient.Status)
+
+func (f observerFunc) SetControlClientStatus(s controlclient.Status) {
+	f(s)
+}
+
 func fakeControlClient(t *testing.T, c *http.Client) *controlclient.Auto {
 	hi := hostinfo.New()
 	ni := tailcfg.NetInfo{LinkType: "wired"}
@@ -43,7 +49,7 @@ func fakeControlClient(t *testing.T, c *http.Client) *controlclient.Auto {
 		},
 		HTTPTestClient:  c,
 		NoiseTestClient: c,
-		Status:          func(controlclient.Status) {},
+		Observer:        observerFunc(func(controlclient.Status) {}),
 	}
 
 	cc, err := controlclient.NewNoStart(opts)
@@ -558,26 +564,26 @@ func TestTKAFilterNetmap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nm := netmap.NetworkMap{
-		Peers: []*tailcfg.Node{
+	nm := &netmap.NetworkMap{
+		Peers: nodeViews([]*tailcfg.Node{
 			{ID: 1, Key: n1.Public(), KeySignature: n1GoodSig.Serialize()},
 			{ID: 2, Key: n2.Public(), KeySignature: nil},                   // missing sig
 			{ID: 3, Key: n3.Public(), KeySignature: n1GoodSig.Serialize()}, // someone elses sig
 			{ID: 4, Key: n4.Public(), KeySignature: n4Sig.Serialize()},     // messed-up signature
 			{ID: 5, Key: n5.Public(), KeySignature: n5GoodSig.Serialize()},
-		},
+		}),
 	}
 
 	b := &LocalBackend{
 		logf: t.Logf,
 		tka:  &tkaState{authority: authority},
 	}
-	b.tkaFilterNetmapLocked(&nm)
+	b.tkaFilterNetmapLocked(nm)
 
-	want := []*tailcfg.Node{
+	want := nodeViews([]*tailcfg.Node{
 		{ID: 1, Key: n1.Public(), KeySignature: n1GoodSig.Serialize()},
 		{ID: 5, Key: n5.Public(), KeySignature: n5GoodSig.Serialize()},
-	}
+	})
 	nodePubComparer := cmp.Comparer(func(x, y key.NodePublic) bool {
 		return x.Raw32() == y.Raw32()
 	})
@@ -992,5 +998,131 @@ func TestTKAAffectedSigs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTKARecoverCompromisedKeyFlow(t *testing.T) {
+	nodePriv := key.NewNode()
+	nlPriv := key.NewNLPrivate()
+	cosignPriv := key.NewNLPrivate()
+	compromisedPriv := key.NewNLPrivate()
+
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	must.Do(pm.SetPrefs((&ipn.Prefs{
+		Persist: &persist.Persist{
+			PrivateNodeKey: nodePriv,
+			NetworkLockKey: nlPriv,
+		},
+	}).View()))
+
+	// Make a fake TKA authority, to seed local state.
+	disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
+	key := tka.Key{Kind: tka.Key25519, Public: nlPriv.Public().Verifier(), Votes: 2}
+	cosignKey := tka.Key{Kind: tka.Key25519, Public: cosignPriv.Public().Verifier(), Votes: 2}
+	compromisedKey := tka.Key{Kind: tka.Key25519, Public: compromisedPriv.Public().Verifier(), Votes: 1}
+
+	temp := t.TempDir()
+	tkaPath := filepath.Join(temp, "tka-profile", string(pm.CurrentProfile().ID))
+	os.Mkdir(tkaPath, 0755)
+	chonk, err := tka.ChonkDir(tkaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _, err := tka.Create(chonk, tka.State{
+		Keys:               []tka.Key{key, compromisedKey, cosignKey},
+		DisablementSecrets: [][]byte{tka.DisablementKDF(disablementSecret)},
+	}, nlPriv)
+	if err != nil {
+		t.Fatalf("tka.Create() failed: %v", err)
+	}
+
+	ts, client := fakeNoiseServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch r.URL.Path {
+		case "/machine/tka/sync/send":
+			body := new(tailcfg.TKASyncSendRequest)
+			if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("got sync send:\n%+v", body)
+
+			var remoteHead tka.AUMHash
+			if err := remoteHead.UnmarshalText([]byte(body.Head)); err != nil {
+				t.Fatalf("head unmarshal: %v", err)
+			}
+			toApply := make([]tka.AUM, len(body.MissingAUMs))
+			for i, a := range body.MissingAUMs {
+				if err := toApply[i].Unserialize(a); err != nil {
+					t.Fatalf("decoding missingAUM[%d]: %v", i, err)
+				}
+			}
+
+			// Apply the recovery AUM to an authority to make sure it works.
+			if err := authority.Inform(chonk, toApply); err != nil {
+				t.Errorf("recovery AUM could not be applied: %v", err)
+			}
+			// Make sure the key we removed isn't trusted.
+			if authority.KeyTrusted(compromisedPriv.KeyID()) {
+				t.Error("compromised key was not removed from tka")
+			}
+
+			w.WriteHeader(200)
+			if err := json.NewEncoder(w).Encode(tailcfg.TKASubmitSignatureResponse{}); err != nil {
+				t.Fatal(err)
+			}
+
+		default:
+			t.Errorf("unhandled endpoint path: %v", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer ts.Close()
+	cc := fakeControlClient(t, client)
+	b := LocalBackend{
+		varRoot: temp,
+		cc:      cc,
+		ccAuto:  cc,
+		logf:    t.Logf,
+		tka: &tkaState{
+			authority: authority,
+			storage:   chonk,
+		},
+		pm:    pm,
+		store: pm.Store(),
+	}
+
+	aum, err := b.NetworkLockGenerateRecoveryAUM([]tkatype.KeyID{compromisedPriv.KeyID()}, tka.AUMHash{})
+	if err != nil {
+		t.Fatalf("NetworkLockGenerateRecoveryAUM() failed: %v", err)
+	}
+
+	// Cosign using the cosigning key.
+	{
+		pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+		must.Do(pm.SetPrefs((&ipn.Prefs{
+			Persist: &persist.Persist{
+				PrivateNodeKey: nodePriv,
+				NetworkLockKey: cosignPriv,
+			},
+		}).View()))
+		b := LocalBackend{
+			varRoot: temp,
+			logf:    t.Logf,
+			tka: &tkaState{
+				authority: authority,
+				storage:   chonk,
+			},
+			pm:    pm,
+			store: pm.Store(),
+		}
+		if aum, err = b.NetworkLockCosignRecoveryAUM(aum); err != nil {
+			t.Fatalf("NetworkLockCosignRecoveryAUM() failed: %v", err)
+		}
+	}
+
+	// Finally, submit the recovery AUM. Validation is done
+	// in the fake control handler.
+	if err := b.NetworkLockSubmitRecoveryAUM(aum); err != nil {
+		t.Errorf("NetworkLockSubmitRecoveryAUM() failed: %v", err)
 	}
 }

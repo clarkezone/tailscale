@@ -144,7 +144,7 @@ jobs:
       # Don't use -bench=. -benchtime=1x.
       # Somewhere in the layers (powershell?)
       # the equals signs cause great confusion.
-      run: go test -bench . -benchtime 1x ./...
+      run: go run ./cmd/testwrapper ./... -bench . -benchtime 1x
 
   vm:
     runs-on: ["self-hosted", "linux", "vm"]
@@ -193,6 +193,9 @@ jobs:
           - goos: freebsd
             goarch: amd64
           - goos: openbsd
+            goarch: amd64
+          # Plan9
+          - goos: plan9
             goarch: amd64
 
     runs-on: ubuntu-22.04

@@ -37,7 +37,7 @@ not open source.
 
 ## Building
 
-We always require the latest Go release, currently Go 1.20. (While we build
+We always require the latest Go release, currently Go 1.21. (While we build
 releases with our [Go fork](https://github.com/tailscale/go/), its use is not
 required.)
 
@@ -56,6 +56,17 @@ instead, to burn commit IDs and version info into the binaries:
 If your distro has conventions that preclude the use of
 `build_dist.sh`, please do the equivalent of what it does in your
 distro's way, so that bug reports contain useful version information.
+
+## Building the web client
+
+To include the embedded web client (accessed via the `tailscale web` command),
+you'll need to build the client assets using:
+
+```
+./tool/yarn --cwd client/web build
+```
+
+Do this before building the `tailscale.com/cmd/tailscale` binary.
 
 ## Bugs
 

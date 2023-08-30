@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build go1.19
+//go:build go1.21
 
 // The tailscaled program is the Tailscale client daemon. It's configured
 // and controlled via the tailscale CLI program.
@@ -76,6 +76,8 @@ func defaultTunName() string {
 		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
 		// as a magic value that uses/creates any free number.
 		return "utun"
+	case "plan9":
+		return "userspace-networking"
 	case "linux":
 		switch distro.Get() {
 		case distro.Synology:
@@ -394,6 +396,8 @@ func run() error {
 	return startIPNServer(context.Background(), logf, pol.PublicID, sys)
 }
 
+var sigPipe os.Signal // set by sigpipe.go
+
 func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID, sys *tsd.System) error {
 	ln, err := safesocket.Listen(args.socketpath)
 	if err != nil {
@@ -409,7 +413,9 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 	// SIGPIPE sometimes gets generated when CLIs disconnect from
 	// tailscaled. The default action is to terminate the process, we
 	// want to keep running.
-	signal.Ignore(syscall.SIGPIPE)
+	if sigPipe != nil {
+		signal.Ignore(sigPipe)
+	}
 	go func() {
 		select {
 		case s := <-interrupt:

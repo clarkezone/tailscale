@@ -25,6 +25,8 @@ import (
 	"tailscale.com/version/distro"
 )
 
+var c2nLogHeap func(http.ResponseWriter, *http.Request) // non-nil on most platforms (c2n_pprof.go)
+
 func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 	writeJSON := func(v any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -61,7 +63,7 @@ func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 		if secs == 0 {
 			secs -= 1
 		}
-		until := time.Now().Add(time.Duration(secs) * time.Second)
+		until := b.clock.Now().Add(time.Duration(secs) * time.Second)
 		err := b.SetComponentDebugLogging(component, until)
 		var res struct {
 			Error string `json:",omitempty"`
@@ -70,6 +72,13 @@ func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 			res.Error = err.Error()
 		}
 		writeJSON(res)
+	case "/debug/logheap":
+		if c2nLogHeap != nil {
+			c2nLogHeap(w, r)
+		} else {
+			http.Error(w, "not implemented", http.StatusNotImplemented)
+			return
+		}
 	case "/ssh/usernames":
 		var req tailcfg.C2NSSHUsernamesRequest
 		if r.Method == "POST" {
@@ -106,14 +115,7 @@ func (b *LocalBackend) handleC2NUpdate(w http.ResponseWriter, r *http.Request) {
 	// TODO(bradfitz): add some sort of semaphore that prevents two concurrent
 	// updates, or if one happened in the past 5 minutes, or something.
 
-	// TODO(bradfitz): move this type to some leaf package
-	type updateResponse struct {
-		Err       string // error message, if any
-		Enabled   bool   // user has opted-in to remote updates
-		Supported bool   // Tailscale supports updating this OS/platform
-		Started   bool
-	}
-	var res updateResponse
+	var res tailcfg.C2NUpdateResponse
 	res.Enabled = envknob.AllowsRemoteUpdate()
 	res.Supported = runtime.GOOS == "windows" || (runtime.GOOS == "linux" && distro.Get() == distro.Debian)
 

@@ -9,10 +9,11 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
-	"golang.org/x/exp/slices"
 	"tailscale.com/tailcfg"
 )
 
@@ -42,6 +43,21 @@ type ServeConfig struct {
 // There is no implicit port 443. It must contain a colon.
 type HostPort string
 
+// Port extracts just the port number from hp.
+// An error is reported in the case that the hp does not
+// have a valid numeric port ending.
+func (hp HostPort) Port() (uint16, error) {
+	_, port, err := net.SplitHostPort(string(hp))
+	if err != nil {
+		return 0, err
+	}
+	port16, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(port16), nil
+}
+
 // A FunnelConn wraps a net.Conn that is coming over a
 // Funnel connection. It can be used to determine further
 // information about the connection, like the source address
@@ -60,6 +76,42 @@ type FunnelConn struct {
 	// node which is relaying the connection. That address
 	// can be found in Conn.RemoteAddr.
 	Src netip.AddrPort
+}
+
+// ServeStreamRequest defines the JSON request body
+// for the serve stream endpoint
+type ServeStreamRequest struct {
+	// HostPort is the DNS and port of the tailscale
+	// URL.
+	HostPort HostPort `json:",omitempty"`
+
+	// Source is the user's serve source
+	// as defined in the `tailscale serve`
+	// command such as http://127.0.0.1:3000
+	Source string `json:",omitempty"`
+
+	// MountPoint is the path prefix for
+	// the given HostPort.
+	MountPoint string `json:",omitempty"`
+}
+
+// FunnelRequestLog is the JSON type written out to io.Writers
+// watching funnel connections via ipnlocal.StreamServe.
+//
+// This structure is in development and subject to change.
+type FunnelRequestLog struct {
+	Time time.Time `json:",omitempty"` // time of request forwarding
+
+	// SrcAddr is the address that initiated the Funnel request.
+	SrcAddr netip.AddrPort `json:",omitempty"`
+
+	// The following fields are only populated if the connection
+	// initiated from another node on the client's tailnet.
+
+	NodeName        string   `json:",omitempty"` // src node MagicDNS name
+	NodeTags        []string `json:",omitempty"` // src node tags
+	UserLoginName   string   `json:",omitempty"` // src node's owner login (if not tagged)
+	UserDisplayName string   `json:",omitempty"` // src node's owner name (if not tagged)
 }
 
 // WebServerConfig describes a web server's configuration.
@@ -204,31 +256,27 @@ func (sc *ServeConfig) IsFunnelOn() bool {
 // CheckFunnelAccess checks whether Funnel access is allowed for the given node
 // and port.
 // It checks:
-//  1. Funnel is enabled on the Tailnet
-//  2. HTTPS is enabled on the Tailnet
-//  3. the node has the "funnel" nodeAttr
-//  4. the port is allowed for Funnel
+//  1. HTTPS is enabled on the Tailnet
+//  2. the node has the "funnel" nodeAttr
+//  3. the port is allowed for Funnel
 //
 // The nodeAttrs arg should be the node's Self.Capabilities which should contain
 // the attribute we're checking for and possibly warning-capabilities for
 // Funnel.
 func CheckFunnelAccess(port uint16, nodeAttrs []string) error {
-	if slices.Contains(nodeAttrs, tailcfg.CapabilityWarnFunnelNoInvite) {
-		return errors.New("Funnel not enabled; See https://tailscale.com/s/no-funnel.")
-	}
-	if slices.Contains(nodeAttrs, tailcfg.CapabilityWarnFunnelNoHTTPS) {
+	if !slices.Contains(nodeAttrs, tailcfg.CapabilityHTTPS) {
 		return errors.New("Funnel not available; HTTPS must be enabled. See https://tailscale.com/s/https.")
 	}
 	if !slices.Contains(nodeAttrs, tailcfg.NodeAttrFunnel) {
 		return errors.New("Funnel not available; \"funnel\" node attribute not set. See https://tailscale.com/s/no-funnel.")
 	}
-	return checkFunnelPort(port, nodeAttrs)
+	return CheckFunnelPort(port, nodeAttrs)
 }
 
-// checkFunnelPort checks whether the given port is allowed for Funnel.
+// CheckFunnelPort checks whether the given port is allowed for Funnel.
 // It uses the tailcfg.CapabilityFunnelPorts nodeAttr to determine the allowed
 // ports.
-func checkFunnelPort(wantedPort uint16, nodeAttrs []string) error {
+func CheckFunnelPort(wantedPort uint16, nodeAttrs []string) error {
 	deny := func(allowedPorts string) error {
 		if allowedPorts == "" {
 			return fmt.Errorf("port %d is not allowed for funnel", wantedPort)
