@@ -124,7 +124,7 @@ spec:
           secretName: operator-oauth
       containers:
         - name: operator
-          image: tailscale/k8s-operator:unstable
+          image: clarkezone/tsopfixtestoperator:1
           resources:
             requests:
               cpu: 500m
@@ -146,8 +146,11 @@ spec:
               value: /oauth/client_secret
             - name: PROXY_IMAGE
               #              value: tailscale/tailscale:unstable
-              value: clarkezone/tsclientnft:v47
-
+              value: clarkezone/tsopfixtestclient:1
+            - name: AUTH_PROXY
+              value: "false"
+            - name: OPERATOR_USENFT
+              value: "true"
             - name: PROXY_TAGS
               value: tag:k8s
             - name: AUTH_PROXY
